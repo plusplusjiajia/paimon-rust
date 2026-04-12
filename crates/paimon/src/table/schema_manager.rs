@@ -92,7 +92,7 @@ impl SchemaManager {
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
         futures::stream::iter(ids)
-            .map(|id| self.try_schema(id))
+            .map(|id| self.find_schema(id))
             .buffered(LIST_FETCH_CONCURRENCY)
             .try_filter_map(|s| async move { Ok(s) })
             .try_collect()
@@ -107,7 +107,7 @@ impl SchemaManager {
     ///
     /// Reference: [SchemaManager.schema(long)](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
     pub async fn schema(&self, schema_id: i64) -> crate::Result<Arc<TableSchema>> {
-        self.try_schema(schema_id)
+        self.find_schema(schema_id)
             .await?
             .ok_or_else(|| crate::Error::DataInvalid {
                 message: format!(
@@ -120,7 +120,7 @@ impl SchemaManager {
 
     /// Like [`schema`](Self::schema) but returns `None` when the schema file
     /// is missing, for callers that tolerate expiry races.
-    pub async fn try_schema(&self, schema_id: i64) -> crate::Result<Option<Arc<TableSchema>>> {
+    pub async fn find_schema(&self, schema_id: i64) -> crate::Result<Option<Arc<TableSchema>>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(schema) = cache.get(&schema_id) {
