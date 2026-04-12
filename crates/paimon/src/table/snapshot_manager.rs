@@ -268,8 +268,8 @@ impl SnapshotManager {
     ///
     /// Reference: [SnapshotManager.safelyGetAllSnapshots](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java)
     pub async fn list_all(&self) -> crate::Result<Vec<Snapshot>> {
-        let ids = list_prefixed_i64_ids(&self.file_io, &self.snapshot_dir(), SNAPSHOT_PREFIX)
-            .await?;
+        let ids =
+            list_prefixed_i64_ids(&self.file_io, &self.snapshot_dir(), SNAPSHOT_PREFIX).await?;
         futures::stream::iter(ids)
             .map(|id| self.find_snapshot(id))
             .buffered(LIST_FETCH_CONCURRENCY)

@@ -244,7 +244,10 @@ mod tests {
             "tagTimeRetained": "PT1H"
         });
         let res: Result<Snapshot, _> = serde_json::from_value(json);
-        assert!(res.is_ok(), "Snapshot must tolerate unknown fields: {res:?}");
+        assert!(
+            res.is_ok(),
+            "Snapshot must tolerate unknown fields: {res:?}"
+        );
     }
 
     #[test]
