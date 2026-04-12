@@ -156,19 +156,31 @@ impl SnapshotManager {
 
     /// Get a snapshot by id.
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
+        self.try_get_snapshot(snapshot_id)
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "snapshot file does not exist: {}",
+                    self.snapshot_path(snapshot_id)
+                ),
+                source: None,
+            })
+    }
+
+    /// Like [`get_snapshot`](Self::get_snapshot) but returns `None` when the
+    /// snapshot file is missing, for callers that tolerate expiry races.
+    pub async fn try_get_snapshot(&self, snapshot_id: i64) -> crate::Result<Option<Snapshot>> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
-        let snap_bytes = snap_input.read().await.map_err(|e| match e {
-            crate::Error::IoUnexpected { ref source, .. }
+        let snap_bytes = match snap_input.read().await {
+            Ok(b) => b,
+            Err(crate::Error::IoUnexpected { ref source, .. })
                 if source.kind() == opendal::ErrorKind::NotFound =>
             {
-                crate::Error::DataInvalid {
-                    message: format!("snapshot file does not exist: {snapshot_path}"),
-                    source: None,
-                }
+                return Ok(None);
             }
-            other => other,
-        })?;
+            Err(e) => return Err(e),
+        };
         let snapshot: Snapshot =
             serde_json::from_slice(&snap_bytes).map_err(|e| crate::Error::DataInvalid {
                 message: format!("snapshot JSON invalid: {e}"),
@@ -180,10 +192,10 @@ impl SnapshotManager {
                     "snapshot file id mismatch: in file name is {snapshot_id}, but file contains snapshot id {}",
                     snapshot.id()
                 ),
-                source: None
+                source: None,
             });
         }
-        Ok(snapshot)
+        Ok(Some(snapshot))
     }
 
     /// Get the latest snapshot, or None if no snapshots exist.
@@ -278,8 +290,9 @@ impl SnapshotManager {
             .collect();
         ids.sort_unstable();
         futures::stream::iter(ids)
-            .map(|id| self.get_snapshot(id))
+            .map(|id| self.try_get_snapshot(id))
             .buffered(LIST_FETCH_CONCURRENCY)
+            .try_filter_map(|s| async move { Ok(s) })
             .try_collect()
             .await
     }
@@ -432,6 +445,12 @@ mod tests {
             result.iter().map(|s| s.id()).collect::<Vec<_>>(),
             vec![1, 3],
         );
+    }
+
+    #[tokio::test]
+    async fn test_try_get_snapshot_returns_none_when_missing() {
+        let (_, sm) = setup("memory:/test_try_get_missing").await;
+        assert!(sm.try_get_snapshot(42).await.unwrap().is_none());
     }
 
     #[tokio::test]
