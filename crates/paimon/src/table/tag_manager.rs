@@ -40,11 +40,19 @@ const TAG_PREFIX: &str = "tag-";
 pub struct Tag {
     #[serde(flatten)]
     snapshot: Snapshot,
-    #[serde(rename = "tagCreateTime", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "tagCreateTime",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     tag_create_time: Option<NaiveDateTime>,
     /// Raw ISO-8601 duration (e.g. `PT1H30M`); not parsed to avoid pulling in
     /// a duration crate just for `$tags` exposure.
-    #[serde(rename = "tagTimeRetained", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "tagTimeRetained",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     tag_time_retained: Option<String>,
 }
 
@@ -147,11 +155,10 @@ impl TagManager {
             }
             Err(e) => return Err(e),
         };
-        let tag: Tag =
-            serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
-                message: format!("tag '{tag_name}' JSON invalid: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let tag: Tag = serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
+            message: format!("tag '{tag_name}' JSON invalid: {e}"),
+            source: Some(Box::new(e)),
+        })?;
         Ok(Some(tag))
     }
 

@@ -184,7 +184,9 @@ mod tests {
         file_io.mkdirs(&dir).await.unwrap();
         write_schema_marker(&file_io, &dir, 0).await;
         // schema-foo (non-numeric) and README (no prefix) must both be ignored.
-        let junk = file_io.new_output(&format!("{dir}/{SCHEMA_PREFIX}foo")).unwrap();
+        let junk = file_io
+            .new_output(&format!("{dir}/{SCHEMA_PREFIX}foo"))
+            .unwrap();
         junk.write(Bytes::from("{}")).await.unwrap();
         let other = file_io.new_output(&format!("{dir}/README")).unwrap();
         other.write(Bytes::from("hi")).await.unwrap();

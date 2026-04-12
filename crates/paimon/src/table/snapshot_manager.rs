@@ -453,9 +453,6 @@ mod tests {
             .unwrap();
 
         let result = sm.list_all().await.unwrap();
-        assert_eq!(
-            result.iter().map(|s| s.id()).collect::<Vec<_>>(),
-            vec![1],
-        );
+        assert_eq!(result.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![1],);
     }
 }
