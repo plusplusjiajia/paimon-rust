@@ -157,6 +157,20 @@ impl FileIO {
         Ok(statuses)
     }
 
+    /// Like [`list_status`](Self::list_status) but returns an empty `Vec` when
+    /// the directory does not exist.
+    pub async fn list_status_or_empty(&self, path: &str) -> Result<Vec<FileStatus>> {
+        match self.list_status(path).await {
+            Ok(s) => Ok(s),
+            Err(Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check if exists.
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>

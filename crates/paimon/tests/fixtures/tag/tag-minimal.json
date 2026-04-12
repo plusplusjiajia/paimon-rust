@@ -1,0 +1,11 @@
+{
+  "version": 3,
+  "id": 1,
+  "schemaId": 0,
+  "baseManifestList": "base",
+  "deltaManifestList": "delta",
+  "commitUser": "u",
+  "commitIdentifier": 1,
+  "commitKind": "APPEND",
+  "timeMillis": 1000
+}

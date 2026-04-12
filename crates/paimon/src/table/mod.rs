@@ -68,6 +68,8 @@ pub struct Table {
     location: String,
     schema: TableSchema,
     schema_manager: SchemaManager,
+    snapshot_manager: SnapshotManager,
+    tag_manager: TagManager,
     rest_env: Option<RESTEnv>,
 }
 
@@ -81,12 +83,16 @@ impl Table {
         rest_env: Option<RESTEnv>,
     ) -> Self {
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), location.clone());
+        let tag_manager = TagManager::new(file_io.clone(), location.clone());
         Self {
             file_io,
             identifier,
             location,
             schema,
             schema_manager,
+            snapshot_manager,
+            tag_manager,
             rest_env,
         }
     }
@@ -116,12 +122,14 @@ impl Table {
         &self.schema_manager
     }
 
-    pub fn snapshot_manager(&self) -> SnapshotManager {
-        SnapshotManager::new(self.file_io.clone(), self.location.clone())
+    /// Get the SnapshotManager for this table.
+    pub fn snapshot_manager(&self) -> &SnapshotManager {
+        &self.snapshot_manager
     }
 
-    pub fn tag_manager(&self) -> TagManager {
-        TagManager::new(self.file_io.clone(), self.location.clone())
+    /// Get the TagManager for this table.
+    pub fn tag_manager(&self) -> &TagManager {
+        &self.tag_manager
     }
 
     /// Create a read builder for scan/read.
@@ -154,6 +162,8 @@ impl Table {
             location: self.location.clone(),
             schema: self.schema.copy_with_options(extra),
             schema_manager: self.schema_manager.clone(),
+            snapshot_manager: self.snapshot_manager.clone(),
+            tag_manager: self.tag_manager.clone(),
             rest_env: self.rest_env.clone(),
         }
     }

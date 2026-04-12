@@ -23,19 +23,16 @@
 use crate::io::FileIO;
 use crate::spec::Snapshot;
 
-use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 const TAG_DIR: &str = "tag";
 const TAG_PREFIX: &str = "tag-";
 
-/// Snapshot extended with tag-specific metadata.
+/// Snapshot extended with tag-specific metadata. Both tag fields are kept as
+/// raw strings to tolerate any format Java's `LocalDateTime.toString()` /
+/// ISO-8601 duration emits.
 ///
 /// Reference: [Tag.java](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/tag/Tag.java)
-//
-// `serde(flatten)` requires that `Snapshot` does NOT use
-// `#[serde(deny_unknown_fields)]`, otherwise the tag-only fields below would
-// fail Snapshot deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Tag {
     #[serde(flatten)]
@@ -45,9 +42,7 @@ pub struct Tag {
         skip_serializing_if = "Option::is_none",
         default
     )]
-    tag_create_time: Option<NaiveDateTime>,
-    /// Raw ISO-8601 duration (e.g. `PT1H30M`); not parsed to avoid pulling in
-    /// a duration crate just for `$tags` exposure.
+    tag_create_time: Option<String>,
     #[serde(
         rename = "tagTimeRetained",
         skip_serializing_if = "Option::is_none",
@@ -61,8 +56,8 @@ impl Tag {
         &self.snapshot
     }
 
-    pub fn tag_create_time(&self) -> Option<NaiveDateTime> {
-        self.tag_create_time
+    pub fn tag_create_time(&self) -> Option<&str> {
+        self.tag_create_time.as_deref()
     }
 
     pub fn tag_time_retained(&self) -> Option<&str> {
@@ -107,19 +102,13 @@ impl TagManager {
         input.exists().await
     }
 
-    /// List all tags sorted by name ascending.
+    /// List all tags sorted lexicographically by name. Tags deleted between
+    /// the directory listing and the per-tag read are silently dropped.
     pub async fn list_all(&self) -> crate::Result<Vec<(String, Tag)>> {
-        let dir = self.tag_directory();
-        // See SnapshotManager::list_all for why we don't precheck exists().
-        let statuses = match self.file_io.list_status(&dir).await {
-            Ok(s) => s,
-            Err(crate::Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e),
-        };
+        let statuses = self
+            .file_io
+            .list_status_or_empty(&self.tag_directory())
+            .await?;
         let mut names: Vec<String> = statuses
             .into_iter()
             .filter_map(|status| {
@@ -165,5 +154,89 @@ impl TagManager {
     /// Get the snapshot portion of a tag, dropping tag-specific metadata.
     pub async fn get_snapshot(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
         Ok(self.get_tag(tag_name).await?.map(|t| t.snapshot))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use bytes::Bytes;
+    use std::env::current_dir;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    fn load_fixture(name: &str) -> String {
+        let path = current_dir()
+            .unwrap()
+            .join(format!("tests/fixtures/tag/{name}.json"));
+        String::from_utf8(std::fs::read(&path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_tag_deserialize_java_fixture() {
+        let tag: Tag = serde_json::from_str(&load_fixture("tag-2024-01-01")).unwrap();
+        assert_eq!(tag.snapshot().id(), 2);
+        assert_eq!(tag.tag_create_time(), Some("2024-01-01T12:34:56.789"));
+        assert_eq!(tag.tag_time_retained(), Some("PT1H30M"));
+
+        let round_trip = serde_json::to_string(&tag).unwrap();
+        let back: Tag = serde_json::from_str(&round_trip).unwrap();
+        assert_eq!(tag, back);
+    }
+
+    #[test]
+    fn test_tag_deserialize_without_tag_fields() {
+        let tag: Tag = serde_json::from_str(&load_fixture("tag-minimal")).unwrap();
+        assert_eq!(tag.snapshot().id(), 1);
+        assert!(tag.tag_create_time().is_none());
+        assert!(tag.tag_time_retained().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_empty_when_directory_missing() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(file_io, "memory:/test_tag_missing".to_string());
+        assert!(tm.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_returns_sorted_tags() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_sorted";
+        let dir = format!("{table_path}/{TAG_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+
+        let payload = load_fixture("tag-minimal");
+        for name in ["v1", "rc2", "alpha"] {
+            let path = format!("{dir}/{TAG_PREFIX}{name}");
+            let out = file_io.new_output(&path).unwrap();
+            out.write(Bytes::from(payload.clone())).await.unwrap();
+        }
+
+        let tm = TagManager::new(file_io, table_path.to_string());
+        let tags = tm.list_all().await.unwrap();
+        let names: Vec<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "rc2", "v1"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_drops_tag_fields() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_get_snapshot";
+        let dir = format!("{table_path}/{TAG_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+        let out = file_io
+            .new_output(&format!("{dir}/{TAG_PREFIX}t1"))
+            .unwrap();
+        out.write(Bytes::from(load_fixture("tag-2024-01-01")))
+            .await
+            .unwrap();
+
+        let tm = TagManager::new(file_io, table_path.to_string());
+        let snap = tm.get_snapshot("t1").await.unwrap().unwrap();
+        assert_eq!(snap.id(), 2);
     }
 }

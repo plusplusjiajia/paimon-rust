@@ -67,17 +67,10 @@ impl SchemaManager {
 
     /// List all schema IDs sorted ascending.
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
-        let dir = self.schema_directory();
-        // See SnapshotManager::list_all for why we don't precheck exists().
-        let statuses = match self.file_io.list_status(&dir).await {
-            Ok(s) => s,
-            Err(crate::Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e),
-        };
+        let statuses = self
+            .file_io
+            .list_status_or_empty(&self.schema_directory())
+            .await?;
         let mut ids = Vec::with_capacity(statuses.len());
         for status in statuses {
             if status.is_dir {
@@ -147,7 +140,6 @@ mod tests {
         FileIOBuilder::new("memory").build().unwrap()
     }
 
-    /// `list_all_ids` does not deserialize, so a stub `{}` payload is enough.
     async fn write_schema_marker(file_io: &FileIO, dir: &str, id: i64) {
         let path = format!("{dir}/{SCHEMA_PREFIX}{id}");
         let out = file_io.new_output(&path).unwrap();
@@ -183,7 +175,6 @@ mod tests {
         let dir = format!("{table_path}/{SCHEMA_DIR}");
         file_io.mkdirs(&dir).await.unwrap();
         write_schema_marker(&file_io, &dir, 0).await;
-        // schema-foo (non-numeric) and README (no prefix) must both be ignored.
         let junk = file_io
             .new_output(&format!("{dir}/{SCHEMA_PREFIX}foo"))
             .unwrap();
