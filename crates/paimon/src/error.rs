@@ -109,6 +109,16 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether this error wraps an `opendal::ErrorKind::NotFound`.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Error::IoUnexpected { source, .. } if source.kind() == opendal::ErrorKind::NotFound
+        )
+    }
+}
+
 impl From<opendal::Error> for Error {
     fn from(source: opendal::Error) -> Self {
         // TODO: Simple use IoUnexpected for now

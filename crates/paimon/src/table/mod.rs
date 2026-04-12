@@ -63,6 +63,28 @@ use std::collections::HashMap;
 /// Max in-flight per-entry fetches in `list_all`-style batch reads.
 pub(crate) const LIST_FETCH_CONCURRENCY: usize = 32;
 
+/// List file names directly under `dir`, strip `prefix`, parse the remainder
+/// as `i64`, and return the sorted ids. Missing dir → empty.
+pub(crate) async fn list_prefixed_i64_ids(
+    file_io: &FileIO,
+    dir: &str,
+    prefix: &str,
+) -> Result<Vec<i64>> {
+    let statuses = file_io.list_status_or_empty(dir).await?;
+    let mut ids: Vec<i64> = statuses
+        .into_iter()
+        .filter(|s| !s.is_dir)
+        .filter_map(|s| {
+            crate::io::path_basename(&s.path)
+                .strip_prefix(prefix)?
+                .parse::<i64>()
+                .ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct Table {

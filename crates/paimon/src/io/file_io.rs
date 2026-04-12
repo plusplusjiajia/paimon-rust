@@ -162,11 +162,7 @@ impl FileIO {
     pub async fn list_status_or_empty(&self, path: &str) -> Result<Vec<FileStatus>> {
         match self.list_status(path).await {
             Ok(s) => Ok(s),
-            Err(Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                Ok(Vec::new())
-            }
+            Err(e) if e.is_not_found() => Ok(Vec::new()),
             Err(e) => Err(e),
         }
     }
@@ -331,10 +327,14 @@ pub struct FileStatus {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-/// Return the final path component (after the last `/`). Intended for file
-/// paths; callers handling directory entries should strip any trailing slash.
+/// Return the final path component. Trailing slashes (as opendal emits for
+/// directories) are stripped before splitting, so `"foo/bar/"` returns `"bar"`.
 pub fn path_basename(path: &str) -> &str {
-    path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path)
+    let trimmed = path.trim_end_matches('/');
+    trimmed
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(trimmed)
 }
 
 #[derive(Debug)]

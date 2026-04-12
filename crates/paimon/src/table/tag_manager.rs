@@ -37,7 +37,7 @@ const TAG_PREFIX: &str = "tag-";
 /// from adding fields named `tagCreateTime` / `tagTimeRetained`.
 ///
 /// Reference: [Tag.java](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/tag/Tag.java)
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tag {
     /// Populated from the file name after deserialization; absent in the JSON.
     #[serde(skip, default)]
@@ -75,6 +75,18 @@ impl Tag {
         self.tag_time_retained.as_deref()
     }
 }
+
+// `name` is metadata derived from the file path, not part of the on-disk
+// payload, so it must not influence equality.
+impl PartialEq for Tag {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+            && self.tag_create_time == other.tag_create_time
+            && self.tag_time_retained == other.tag_time_retained
+    }
+}
+
+impl Eq for Tag {}
 
 /// Manager for tag files using unified FileIO.
 ///
@@ -132,7 +144,7 @@ impl TagManager {
         names.sort_unstable();
 
         futures::stream::iter(names)
-            .map(|name| self.get_tag(name))
+            .map(|name| async move { self.get_tag(&name).await })
             .buffered(LIST_FETCH_CONCURRENCY)
             .try_filter_map(|t| async move { Ok(t) })
             .try_collect()
@@ -142,17 +154,12 @@ impl TagManager {
     /// Get the tag for a name, or None if the tag file does not exist.
     ///
     /// Reads directly and catches NotFound to avoid a separate exists() IO round-trip.
-    pub async fn get_tag(&self, tag_name: impl Into<String>) -> crate::Result<Option<Tag>> {
-        let tag_name = tag_name.into();
-        let path = self.tag_path(&tag_name);
+    pub async fn get_tag(&self, tag_name: &str) -> crate::Result<Option<Tag>> {
+        let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
         let bytes = match input.read().await {
             Ok(b) => b,
-            Err(crate::Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(None);
-            }
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
         let mut tag: Tag =
@@ -160,7 +167,7 @@ impl TagManager {
                 message: format!("tag '{tag_name}' JSON invalid: {e}"),
                 source: Some(Box::new(e)),
             })?;
-        tag.name = tag_name;
+        tag.name = tag_name.to_owned();
         Ok(Some(tag))
     }
 
@@ -203,6 +210,41 @@ mod tests {
         let round_trip = serde_json::to_string(&tag).unwrap();
         let back: Tag = serde_json::from_str(&round_trip).unwrap();
         assert_eq!(tag, back);
+    }
+
+    /// `Tag::eq` must ignore the synthetic `name` field, otherwise round-trip
+    /// comparison and downstream uniqueness checks would silently misbehave.
+    #[test]
+    fn test_tag_eq_ignores_name() {
+        let json = load_fixture("tag-2024-01-01");
+        let mut a: Tag = serde_json::from_str(&json).unwrap();
+        let mut b: Tag = serde_json::from_str(&json).unwrap();
+        a.name = "v1".into();
+        b.name = "v2".into();
+        assert_eq!(a, b);
+    }
+
+    /// `Tag` flattens `Snapshot`, which only works as long as `Snapshot`
+    /// tolerates unknown JSON keys. If a future change adds
+    /// `#[serde(deny_unknown_fields)]` to `Snapshot`, this test fails and
+    /// the brittle assumption is caught at the source.
+    #[test]
+    fn test_snapshot_tolerates_unknown_fields() {
+        let json = serde_json::json!({
+            "version": 3,
+            "id": 1,
+            "schemaId": 0,
+            "baseManifestList": "base",
+            "deltaManifestList": "delta",
+            "commitUser": "u",
+            "commitIdentifier": 1,
+            "commitKind": "APPEND",
+            "timeMillis": 1000,
+            "tagCreateTime": "2024-01-01T00:00",
+            "tagTimeRetained": "PT1H"
+        });
+        let res: Result<Snapshot, _> = serde_json::from_value(json);
+        assert!(res.is_ok(), "Snapshot must tolerate unknown fields: {res:?}");
     }
 
     #[test]

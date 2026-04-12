@@ -19,9 +19,9 @@
 //!
 //! Reference: [org.apache.paimon.schema.SchemaManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
 
-use crate::io::{path_basename, FileIO};
+use crate::io::FileIO;
 use crate::spec::TableSchema;
-use crate::table::LIST_FETCH_CONCURRENCY;
+use crate::table::{list_prefixed_i64_ids, LIST_FETCH_CONCURRENCY};
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,26 +69,12 @@ impl SchemaManager {
 
     /// List all schema IDs sorted ascending.
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
-        let statuses = self
-            .file_io
-            .list_status_or_empty(&self.schema_directory())
-            .await?;
-        let mut ids: Vec<i64> = statuses
-            .into_iter()
-            .filter(|s| !s.is_dir)
-            .filter_map(|s| {
-                path_basename(&s.path)
-                    .strip_prefix(SCHEMA_PREFIX)?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .collect();
-        ids.sort_unstable();
-        Ok(ids)
+        list_prefixed_i64_ids(&self.file_io, &self.schema_directory(), SCHEMA_PREFIX).await
     }
 
-    /// List all schemas sorted by id ascending. Schemas deleted between the
-    /// directory listing and the per-schema read are silently dropped.
+    /// List all schemas sorted by id ascending. Schema files that disappear
+    /// between the directory listing and the per-schema read are silently
+    /// dropped; JSON parse failures and id-mismatch errors still propagate.
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
         futures::stream::iter(ids)
@@ -132,11 +118,7 @@ impl SchemaManager {
         let input = self.file_io.new_input(&path)?;
         let bytes = match input.read().await {
             Ok(b) => b,
-            Err(crate::Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(None);
-            }
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
         let schema: TableSchema =

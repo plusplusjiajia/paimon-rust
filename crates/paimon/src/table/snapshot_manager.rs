@@ -20,7 +20,7 @@
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::io::{path_basename, FileIO};
 use crate::spec::Snapshot;
-use crate::table::LIST_FETCH_CONCURRENCY;
+use crate::table::{list_prefixed_i64_ids, LIST_FETCH_CONCURRENCY};
 use futures::{StreamExt, TryStreamExt};
 use std::str;
 
@@ -172,11 +172,7 @@ impl SnapshotManager {
         let snap_input = self.file_io.new_input(&snapshot_path)?;
         let snap_bytes = match snap_input.read().await {
             Ok(b) => b,
-            Err(crate::Error::IoUnexpected { ref source, .. })
-                if source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(None);
-            }
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
         let snapshot: Snapshot =
@@ -272,21 +268,8 @@ impl SnapshotManager {
     ///
     /// Reference: [SnapshotManager.safelyGetAllSnapshots](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java)
     pub async fn list_all(&self) -> crate::Result<Vec<Snapshot>> {
-        let statuses = self
-            .file_io
-            .list_status_or_empty(&self.snapshot_dir())
+        let ids = list_prefixed_i64_ids(&self.file_io, &self.snapshot_dir(), SNAPSHOT_PREFIX)
             .await?;
-        let mut ids: Vec<i64> = statuses
-            .into_iter()
-            .filter(|s| !s.is_dir)
-            .filter_map(|s| {
-                path_basename(&s.path)
-                    .strip_prefix(SNAPSHOT_PREFIX)?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .collect();
-        ids.sort_unstable();
         futures::stream::iter(ids)
             .map(|id| self.find_snapshot(id))
             .buffered(LIST_FETCH_CONCURRENCY)
