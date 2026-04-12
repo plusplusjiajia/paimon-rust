@@ -44,6 +44,7 @@ mod full_text_search;
 mod physical_plan;
 mod relation_planner;
 pub mod runtime;
+mod system_tables;
 mod table;
 
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
