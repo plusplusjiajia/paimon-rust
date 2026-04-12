@@ -35,6 +35,19 @@ pub enum CommitKind {
     ANALYZE,
 }
 
+impl CommitKind {
+    /// Wire string matching Java `CommitKind.toString()`. Explicit match to
+    /// avoid coupling the on-wire format to `Debug` derive output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommitKind::APPEND => "APPEND",
+            CommitKind::COMPACT => "COMPACT",
+            CommitKind::OVERWRITE => "OVERWRITE",
+            CommitKind::ANALYZE => "ANALYZE",
+        }
+    }
+}
+
 /// Snapshot for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L68>.

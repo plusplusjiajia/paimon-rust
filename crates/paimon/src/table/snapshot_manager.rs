@@ -250,6 +250,38 @@ impl SnapshotManager {
             .await
     }
 
+    /// List all snapshots sorted by id ascending. Gaps from expired snapshots
+    /// are skipped.
+    ///
+    /// Reference: [SnapshotManager.safelyGetAllSnapshots](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java)
+    pub async fn list_all(&self) -> crate::Result<Vec<Snapshot>> {
+        // opendal memory backend reports `exists(dir) == false` even when the
+        // dir holds files, so list_status directly and treat NotFound as empty.
+        let snapshot_dir = self.snapshot_dir();
+        let statuses = match self.file_io.list_status(&snapshot_dir).await {
+            Ok(s) => s,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter_map(|status| {
+                if status.is_dir {
+                    return None;
+                }
+                let name = status.path.rsplit('/').next().unwrap_or(&status.path);
+                name.strip_prefix(SNAPSHOT_PREFIX)
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .collect();
+        ids.sort_unstable();
+        futures::future::try_join_all(ids.into_iter().map(|id| self.get_snapshot(id))).await
+    }
+
     /// Returns the snapshot whose commit time is earlier than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///
@@ -365,5 +397,65 @@ mod tests {
         sm.write_latest_hint(42).await.unwrap();
         let hint = sm.read_hint(&sm.latest_hint_path()).await;
         assert_eq!(hint, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_list_all_empty_when_no_snapshots() {
+        let (_, sm) = setup("memory:/test_list_all_empty").await;
+        let result = sm.list_all().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_returns_snapshots_in_order() {
+        let (_, sm) = setup("memory:/test_list_all_ordered").await;
+        for id in [1, 2, 3] {
+            sm.commit_snapshot(&test_snapshot(id)).await.unwrap();
+        }
+        let result = sm.list_all().await.unwrap();
+        assert_eq!(
+            result.iter().map(|s| s.id()).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_all_skips_gaps_from_expired_snapshots() {
+        // list_all scans the snapshot dir, so leaving id 2 unwritten is
+        // sufficient to exercise the gap-skip path.
+        let (_, sm) = setup("memory:/test_list_all_gap").await;
+        sm.commit_snapshot(&test_snapshot(1)).await.unwrap();
+        sm.commit_snapshot(&test_snapshot(3)).await.unwrap();
+
+        let result = sm.list_all().await.unwrap();
+        assert_eq!(
+            result.iter().map(|s| s.id()).collect::<Vec<_>>(),
+            vec![1, 3],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ignores_hint_files() {
+        // EARLIEST/LATEST hint files must not be parsed as snapshots.
+        let (file_io, sm) = setup("memory:/test_list_all_hints").await;
+        sm.commit_snapshot(&test_snapshot(1)).await.unwrap();
+        file_io
+            .new_output(&format!("{}/EARLIEST", sm.snapshot_dir()))
+            .unwrap()
+            .write(bytes::Bytes::from("1"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&sm.latest_hint_path())
+            .unwrap()
+            .write(bytes::Bytes::from("1"))
+            .await
+            .unwrap();
+
+        let result = sm.list_all().await.unwrap();
+        assert_eq!(
+            result.iter().map(|s| s.id()).collect::<Vec<_>>(),
+            vec![1],
+        );
     }
 }

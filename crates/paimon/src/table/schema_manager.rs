@@ -65,6 +65,41 @@ impl SchemaManager {
         format!("{}/{}{}", self.schema_directory(), SCHEMA_PREFIX, schema_id)
     }
 
+    /// List all schema IDs sorted ascending.
+    pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
+        let dir = self.schema_directory();
+        // See SnapshotManager::list_all for why we don't precheck exists().
+        let statuses = match self.file_io.list_status(&dir).await {
+            Ok(s) => s,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut ids = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            if status.is_dir {
+                continue;
+            }
+            let name = status.path.rsplit('/').next().unwrap_or(&status.path);
+            if let Some(id_str) = name.strip_prefix(SCHEMA_PREFIX) {
+                if let Ok(id) = id_str.parse::<i64>() {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// List all schemas sorted by id ascending. Loads via the cache.
+    pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
+        let ids = self.list_all_ids().await?;
+        futures::future::try_join_all(ids.into_iter().map(|id| self.schema(id))).await
+    }
+
     /// Load a schema by ID. Returns cached version if available.
     ///
     /// The cache is shared across all clones of this `SchemaManager`, so loading
@@ -99,5 +134,62 @@ impl SchemaManager {
         }
 
         Ok(schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use bytes::Bytes;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    /// `list_all_ids` does not deserialize, so a stub `{}` payload is enough.
+    async fn write_schema_marker(file_io: &FileIO, dir: &str, id: i64) {
+        let path = format!("{dir}/{SCHEMA_PREFIX}{id}");
+        let out = file_io.new_output(&path).unwrap();
+        out.write(Bytes::from("{}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_empty_when_directory_missing() {
+        let file_io = test_file_io();
+        let sm = SchemaManager::new(file_io, "memory:/test_schema_missing".to_string());
+        assert!(sm.list_all_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_returns_sorted_ids() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_schema_sorted";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+        for id in [3, 1, 2] {
+            write_schema_marker(&file_io, &dir, id).await;
+        }
+
+        let sm = SchemaManager::new(file_io, table_path.to_string());
+        let ids = sm.list_all_ids().await.unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_skips_unrelated_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_schema_filter";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+        write_schema_marker(&file_io, &dir, 0).await;
+        // schema-foo (non-numeric) and README (no prefix) must both be ignored.
+        let junk = file_io.new_output(&format!("{dir}/{SCHEMA_PREFIX}foo")).unwrap();
+        junk.write(Bytes::from("{}")).await.unwrap();
+        let other = file_io.new_output(&format!("{dir}/README")).unwrap();
+        other.write(Bytes::from("hi")).await.unwrap();
+
+        let sm = SchemaManager::new(file_io, table_path.to_string());
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![0]);
     }
 }

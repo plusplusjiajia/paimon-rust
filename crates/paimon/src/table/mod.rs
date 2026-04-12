@@ -52,7 +52,7 @@ pub use source::{
 };
 pub use table_commit::TableCommit;
 pub use table_scan::TableScan;
-pub use tag_manager::TagManager;
+pub use tag_manager::{Tag, TagManager};
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
@@ -114,6 +114,14 @@ impl Table {
     /// Get the SchemaManager for this table.
     pub fn schema_manager(&self) -> &SchemaManager {
         &self.schema_manager
+    }
+
+    pub fn snapshot_manager(&self) -> SnapshotManager {
+        SnapshotManager::new(self.file_io.clone(), self.location.clone())
+    }
+
+    pub fn tag_manager(&self) -> TagManager {
+        TagManager::new(self.file_io.clone(), self.location.clone())
     }
 
     /// Create a read builder for scan/read.

@@ -369,7 +369,7 @@ impl<'a> TableScan<'a> {
         match core_options.try_time_travel_selector()? {
             Some(TimeTravelSelector::TagName(tag_name)) => {
                 let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
-                match tag_manager.get(tag_name).await? {
+                match tag_manager.get_snapshot(tag_name).await? {
                     Some(s) => Ok(Some(s)),
                     None => Err(Error::DataInvalid {
                         message: format!("Tag '{tag_name}' doesn't exist."),
