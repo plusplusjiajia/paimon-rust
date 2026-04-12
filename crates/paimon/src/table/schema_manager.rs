@@ -123,6 +123,15 @@ impl SchemaManager {
                 message: format!("Failed to parse schema file: {path}"),
                 source: Some(Box::new(e)),
             })?;
+        if schema.id() != schema_id {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "schema file id mismatch: in file name is {schema_id}, but file contains schema id {}",
+                    schema.id()
+                ),
+                source: None,
+            });
+        }
         let schema = Arc::new(schema);
 
         // Insert into shared cache (short lock).
@@ -171,6 +180,44 @@ mod tests {
         let sm = SchemaManager::new(file_io, table_path.to_string());
         let ids = sm.list_all_ids().await.unwrap();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    async fn write_schema_file(file_io: &FileIO, dir: &str, file_id: i64, content_id: i64) {
+        let schema = crate::spec::Schema::builder().build().unwrap();
+        let table_schema = TableSchema::new(content_id, &schema);
+        let json = serde_json::to_vec(&table_schema).unwrap();
+        let path = format!("{dir}/{SCHEMA_PREFIX}{file_id}");
+        let out = file_io.new_output(&path).unwrap();
+        out.write(Bytes::from(json)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_schema_rejects_id_mismatch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_schema_mismatch";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+        write_schema_file(&file_io, &dir, 1, 2).await;
+
+        let sm = SchemaManager::new(file_io, table_path.to_string());
+        let err = sm.schema(1).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("schema file id mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_all_validates_id_match() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_schema_list_all_mismatch";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+        write_schema_file(&file_io, &dir, 0, 0).await;
+        write_schema_file(&file_io, &dir, 1, 99).await;
+
+        let sm = SchemaManager::new(file_io, table_path.to_string());
+        assert!(sm.list_all().await.is_err());
     }
 
     #[tokio::test]

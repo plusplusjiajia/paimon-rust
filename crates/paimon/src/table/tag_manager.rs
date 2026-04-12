@@ -161,7 +161,7 @@ impl TagManager {
         Ok(self.get_tag(tag_name).await?.map(|t| t.snapshot))
     }
 
-    #[deprecated(note = "use get_snapshot or get_tag")]
+    #[deprecated(since = "0.2.0", note = "renamed to get_snapshot")]
     pub async fn get(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
         self.get_snapshot(tag_name).await
     }
