@@ -74,7 +74,8 @@ impl SchemaManager {
 
     /// List all schemas sorted by id ascending. Schema files that disappear
     /// between the directory listing and the per-schema read are silently
-    /// dropped; JSON parse failures and id-mismatch errors still propagate.
+    /// dropped; JSON parse failures still propagate. Like Java `listAll`,
+    /// the in-file id is **not** validated.
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
         futures::stream::iter(ids)
@@ -93,19 +94,30 @@ impl SchemaManager {
     ///
     /// Reference: [SchemaManager.schema(long)](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
     pub async fn schema(&self, schema_id: i64) -> crate::Result<Arc<TableSchema>> {
-        self.find_schema(schema_id)
-            .await?
-            .ok_or_else(|| crate::Error::DataInvalid {
+        let schema =
+            self.find_schema(schema_id)
+                .await?
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "schema file does not exist: {}",
+                        self.schema_path(schema_id)
+                    ),
+                    source: None,
+                })?;
+        if schema.id() != schema_id {
+            return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "schema file does not exist: {}",
-                    self.schema_path(schema_id)
+                    "schema file id mismatch: in file name is {schema_id}, but file contains schema id {}",
+                    schema.id()
                 ),
                 source: None,
-            })
+            });
+        }
+        Ok(schema)
     }
 
-    /// Like [`schema`](Self::schema) but returns `None` when the schema file
-    /// is missing, for callers that tolerate expiry races.
+    /// Like [`schema`](Self::schema) but returns `None` on a missing file
+    /// and does **not** validate the in-file id (Java parity).
     pub async fn find_schema(&self, schema_id: i64) -> crate::Result<Option<Arc<TableSchema>>> {
         {
             let cache = self.cache.lock().unwrap();
@@ -126,15 +138,6 @@ impl SchemaManager {
                 message: format!("Failed to parse schema file: {path}"),
                 source: Some(Box::new(e)),
             })?;
-        if schema.id() != schema_id {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "schema file id mismatch: in file name is {schema_id}, but file contains schema id {}",
-                    schema.id()
-                ),
-                source: None,
-            });
-        }
         let schema = Arc::new(schema);
 
         {
@@ -208,7 +211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_all_validates_id_match() {
+    async fn test_list_all_does_not_validate_id_match() {
         let file_io = test_file_io();
         let table_path = "memory:/test_schema_list_all_mismatch";
         let dir = format!("{table_path}/{SCHEMA_DIR}");
@@ -217,7 +220,9 @@ mod tests {
         write_schema_file(&file_io, &dir, 1, 99).await;
 
         let sm = SchemaManager::new(file_io, table_path.to_string());
-        assert!(sm.list_all().await.is_err());
+        let schemas = sm.list_all().await.unwrap();
+        let ids: Vec<i64> = schemas.iter().map(|s| s.id()).collect();
+        assert_eq!(ids, vec![0, 99]);
     }
 
     #[tokio::test]

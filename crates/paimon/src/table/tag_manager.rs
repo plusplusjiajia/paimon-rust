@@ -76,8 +76,8 @@ impl Tag {
     }
 }
 
-// `name` is metadata derived from the file path, not part of the on-disk
-// payload, so it must not influence equality.
+// `name` comes from the file path, not the JSON, so it is excluded from
+// equality. Any future `Hash` impl must mirror this exclusion.
 impl PartialEq for Tag {
     fn eq(&self, other: &Self) -> bool {
         self.snapshot == other.snapshot

@@ -38,6 +38,9 @@ pub enum CommitKind {
 /// Snapshot for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L68>.
+//
+// Do not add `#[serde(deny_unknown_fields)]`: `table::Tag` flattens this
+// struct and carries extra keys. Guarded by `test_snapshot_tolerates_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, TypedBuilder)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {

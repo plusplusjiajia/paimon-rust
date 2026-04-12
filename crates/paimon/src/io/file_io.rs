@@ -329,7 +329,7 @@ pub struct FileStatus {
 
 /// Return the final path component. Trailing slashes (as opendal emits for
 /// directories) are stripped before splitting, so `"foo/bar/"` returns `"bar"`.
-pub fn path_basename(path: &str) -> &str {
+pub(crate) fn path_basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     trimmed
         .rsplit_once('/')

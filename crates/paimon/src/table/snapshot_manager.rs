@@ -154,19 +154,30 @@ impl SnapshotManager {
 
     /// Get a snapshot by id.
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
-        self.find_snapshot(snapshot_id)
-            .await?
-            .ok_or_else(|| crate::Error::DataInvalid {
+        let snapshot =
+            self.find_snapshot(snapshot_id)
+                .await?
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "snapshot file does not exist: {}",
+                        self.snapshot_path(snapshot_id)
+                    ),
+                    source: None,
+                })?;
+        if snapshot.id() != snapshot_id {
+            return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "snapshot file does not exist: {}",
-                    self.snapshot_path(snapshot_id)
+                    "snapshot file id mismatch: in file name is {snapshot_id}, but file contains snapshot id {}",
+                    snapshot.id()
                 ),
                 source: None,
-            })
+            });
+        }
+        Ok(snapshot)
     }
 
-    /// Like [`get_snapshot`](Self::get_snapshot) but returns `None` when the
-    /// snapshot file is missing, for callers that tolerate expiry races.
+    /// Like [`get_snapshot`](Self::get_snapshot) but returns `None` on a
+    /// missing file and does **not** validate the in-file id (Java parity).
     pub async fn find_snapshot(&self, snapshot_id: i64) -> crate::Result<Option<Snapshot>> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
@@ -180,15 +191,6 @@ impl SnapshotManager {
                 message: format!("snapshot JSON invalid: {e}"),
                 source: Some(Box::new(e)),
             })?;
-        if snapshot.id() != snapshot_id {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "snapshot file id mismatch: in file name is {snapshot_id}, but file contains snapshot id {}",
-                    snapshot.id()
-                ),
-                source: None,
-            });
-        }
         Ok(Some(snapshot))
     }
 

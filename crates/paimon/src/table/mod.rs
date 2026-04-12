@@ -64,7 +64,9 @@ use std::collections::HashMap;
 pub(crate) const LIST_FETCH_CONCURRENCY: usize = 32;
 
 /// List file names directly under `dir`, strip `prefix`, parse the remainder
-/// as `i64`, and return the sorted ids. Missing dir → empty.
+/// as `i64`, and return the sorted ids. Missing dir → empty. Entries whose
+/// suffix is not a valid `i64` (non-numeric, overflow, empty) are silently
+/// skipped — callers needing detection should walk [`FileIO::list_status`].
 pub(crate) async fn list_prefixed_i64_ids(
     file_io: &FileIO,
     dir: &str,
