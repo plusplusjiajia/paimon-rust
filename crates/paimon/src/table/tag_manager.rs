@@ -23,10 +23,13 @@
 use crate::io::FileIO;
 use crate::spec::Snapshot;
 
+use futures::{StreamExt, TryStreamExt};
+use opendal::raw::get_basename;
 use serde::{Deserialize, Serialize};
 
 const TAG_DIR: &str = "tag";
 const TAG_PREFIX: &str = "tag-";
+const LIST_FETCH_CONCURRENCY: usize = 32;
 
 /// Snapshot extended with tag-specific metadata. Both tag fields are kept as
 /// raw strings to tolerate any format Java's `LocalDateTime.toString()` /
@@ -111,22 +114,24 @@ impl TagManager {
             .await?;
         let mut names: Vec<String> = statuses
             .into_iter()
-            .filter_map(|status| {
-                if status.is_dir {
-                    return None;
-                }
-                let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-                name.strip_prefix(TAG_PREFIX).map(|s| s.to_string())
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                get_basename(&s.path)
+                    .strip_prefix(TAG_PREFIX)
+                    .map(String::from)
             })
             .collect();
         names.sort_unstable();
 
-        let tags = futures::future::try_join_all(names.iter().map(|n| self.get_tag(n))).await?;
-        Ok(names
-            .into_iter()
-            .zip(tags)
-            .filter_map(|(n, t)| t.map(|t| (n, t)))
-            .collect())
+        futures::stream::iter(names)
+            .map(|name| async move {
+                let tag = self.get_tag(&name).await?;
+                Ok::<_, crate::Error>(tag.map(|t| (name, t)))
+            })
+            .buffered(LIST_FETCH_CONCURRENCY)
+            .try_filter_map(|x| async move { Ok(x) })
+            .try_collect()
+            .await
     }
 
     /// Get the tag for a name, or None if the tag file does not exist.

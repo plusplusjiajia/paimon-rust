@@ -21,11 +21,14 @@
 
 use crate::io::FileIO;
 use crate::spec::TableSchema;
+use futures::{StreamExt, TryStreamExt};
+use opendal::raw::get_basename;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_DIR: &str = "schema";
 const SCHEMA_PREFIX: &str = "schema-";
+const LIST_FETCH_CONCURRENCY: usize = 32;
 
 /// Manager for versioned table schema files.
 ///
@@ -71,26 +74,28 @@ impl SchemaManager {
             .file_io
             .list_status_or_empty(&self.schema_directory())
             .await?;
-        let mut ids = Vec::with_capacity(statuses.len());
-        for status in statuses {
-            if status.is_dir {
-                continue;
-            }
-            let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-            if let Some(id_str) = name.strip_prefix(SCHEMA_PREFIX) {
-                if let Ok(id) = id_str.parse::<i64>() {
-                    ids.push(id);
-                }
-            }
-        }
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                get_basename(&s.path)
+                    .strip_prefix(SCHEMA_PREFIX)?
+                    .parse::<i64>()
+                    .ok()
+            })
+            .collect();
         ids.sort_unstable();
         Ok(ids)
     }
 
-    /// List all schemas sorted by id ascending. Loads via the cache.
+    /// List all schemas sorted by id ascending.
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
-        futures::future::try_join_all(ids.into_iter().map(|id| self.schema(id))).await
+        futures::stream::iter(ids)
+            .map(|id| self.schema(id))
+            .buffered(LIST_FETCH_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Load a schema by ID. Returns cached version if available.

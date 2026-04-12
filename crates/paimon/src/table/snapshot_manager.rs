@@ -20,7 +20,11 @@
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::io::FileIO;
 use crate::spec::Snapshot;
+use futures::{StreamExt, TryStreamExt};
+use opendal::raw::get_basename;
 use std::str;
+
+const LIST_FETCH_CONCURRENCY: usize = 32;
 
 const SNAPSHOT_DIR: &str = "snapshot";
 const SNAPSHOT_PREFIX: &str = "snapshot-";
@@ -99,14 +103,14 @@ impl SnapshotManager {
             if status.is_dir {
                 continue;
             }
-            let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-            if let Some(id_str) = name.strip_prefix(SNAPSHOT_PREFIX) {
-                if let Ok(id) = id_str.parse::<i64>() {
-                    result = Some(match result {
-                        Some(r) => reducer(r, id),
-                        None => id,
-                    });
-                }
+            if let Some(id) = get_basename(&status.path)
+                .strip_prefix(SNAPSHOT_PREFIX)
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                result = Some(match result {
+                    Some(r) => reducer(r, id),
+                    None => id,
+                });
             }
         }
         Ok(result)
@@ -154,13 +158,17 @@ impl SnapshotManager {
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
-        if !snap_input.exists().await? {
-            return Err(crate::Error::DataInvalid {
-                message: format!("snapshot file does not exist: {snapshot_path}"),
-                source: None,
-            });
-        }
-        let snap_bytes = snap_input.read().await?;
+        let snap_bytes = snap_input.read().await.map_err(|e| match e {
+            crate::Error::IoUnexpected { ref source, .. }
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                crate::Error::DataInvalid {
+                    message: format!("snapshot file does not exist: {snapshot_path}"),
+                    source: None,
+                }
+            }
+            other => other,
+        })?;
         let snapshot: Snapshot =
             serde_json::from_slice(&snap_bytes).map_err(|e| crate::Error::DataInvalid {
                 message: format!("snapshot JSON invalid: {e}"),
@@ -260,17 +268,20 @@ impl SnapshotManager {
             .await?;
         let mut ids: Vec<i64> = statuses
             .into_iter()
-            .filter_map(|status| {
-                if status.is_dir {
-                    return None;
-                }
-                let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-                name.strip_prefix(SNAPSHOT_PREFIX)
-                    .and_then(|s| s.parse::<i64>().ok())
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                get_basename(&s.path)
+                    .strip_prefix(SNAPSHOT_PREFIX)?
+                    .parse::<i64>()
+                    .ok()
             })
             .collect();
         ids.sort_unstable();
-        futures::future::try_join_all(ids.into_iter().map(|id| self.get_snapshot(id))).await
+        futures::stream::iter(ids)
+            .map(|id| self.get_snapshot(id))
+            .buffered(LIST_FETCH_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Returns the snapshot whose commit time is earlier than or equal to the given
