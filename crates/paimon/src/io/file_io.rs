@@ -331,6 +331,12 @@ pub struct FileStatus {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
+/// Return the final path component (after the last `/`). Intended for file
+/// paths; callers handling directory entries should strip any trailing slash.
+pub fn path_basename(path: &str) -> &str {
+    path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path)
+}
+
 #[derive(Debug)]
 pub struct InputFile {
     op: Operator,

@@ -18,13 +18,11 @@
 //! Snapshot manager for reading snapshot metadata using FileIO.
 //!
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
-use crate::io::FileIO;
+use crate::io::{path_basename, FileIO};
 use crate::spec::Snapshot;
+use crate::table::LIST_FETCH_CONCURRENCY;
 use futures::{StreamExt, TryStreamExt};
-use opendal::raw::get_basename;
 use std::str;
-
-const LIST_FETCH_CONCURRENCY: usize = 32;
 
 const SNAPSHOT_DIR: &str = "snapshot";
 const SNAPSHOT_PREFIX: &str = "snapshot-";
@@ -103,7 +101,7 @@ impl SnapshotManager {
             if status.is_dir {
                 continue;
             }
-            if let Some(id) = get_basename(&status.path)
+            if let Some(id) = path_basename(&status.path)
                 .strip_prefix(SNAPSHOT_PREFIX)
                 .and_then(|s| s.parse::<i64>().ok())
             {
@@ -282,7 +280,7 @@ impl SnapshotManager {
             .into_iter()
             .filter(|s| !s.is_dir)
             .filter_map(|s| {
-                get_basename(&s.path)
+                path_basename(&s.path)
                     .strip_prefix(SNAPSHOT_PREFIX)?
                     .parse::<i64>()
                     .ok()

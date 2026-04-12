@@ -19,16 +19,15 @@
 //!
 //! Reference: [org.apache.paimon.schema.SchemaManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
 
-use crate::io::FileIO;
+use crate::io::{path_basename, FileIO};
 use crate::spec::TableSchema;
+use crate::table::LIST_FETCH_CONCURRENCY;
 use futures::{StreamExt, TryStreamExt};
-use opendal::raw::get_basename;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_DIR: &str = "schema";
 const SCHEMA_PREFIX: &str = "schema-";
-const LIST_FETCH_CONCURRENCY: usize = 32;
 
 /// Manager for versioned table schema files.
 ///
@@ -78,7 +77,7 @@ impl SchemaManager {
             .into_iter()
             .filter(|s| !s.is_dir)
             .filter_map(|s| {
-                get_basename(&s.path)
+                path_basename(&s.path)
                     .strip_prefix(SCHEMA_PREFIX)?
                     .parse::<i64>()
                     .ok()
@@ -88,12 +87,14 @@ impl SchemaManager {
         Ok(ids)
     }
 
-    /// List all schemas sorted by id ascending.
+    /// List all schemas sorted by id ascending. Schemas deleted between the
+    /// directory listing and the per-schema read are silently dropped.
     pub async fn list_all(&self) -> crate::Result<Vec<Arc<TableSchema>>> {
         let ids = self.list_all_ids().await?;
         futures::stream::iter(ids)
-            .map(|id| self.schema(id))
+            .map(|id| self.try_schema(id))
             .buffered(LIST_FETCH_CONCURRENCY)
+            .try_filter_map(|s| async move { Ok(s) })
             .try_collect()
             .await
     }
@@ -106,18 +107,38 @@ impl SchemaManager {
     ///
     /// Reference: [SchemaManager.schema(long)](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
     pub async fn schema(&self, schema_id: i64) -> crate::Result<Arc<TableSchema>> {
-        // Fast path: check cache under a short lock.
+        self.try_schema(schema_id)
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "schema file does not exist: {}",
+                    self.schema_path(schema_id)
+                ),
+                source: None,
+            })
+    }
+
+    /// Like [`schema`](Self::schema) but returns `None` when the schema file
+    /// is missing, for callers that tolerate expiry races.
+    pub async fn try_schema(&self, schema_id: i64) -> crate::Result<Option<Arc<TableSchema>>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(schema) = cache.get(&schema_id) {
-                return Ok(schema.clone());
+                return Ok(Some(schema.clone()));
             }
         }
 
-        // Cache miss — load from file (no lock held during I/O).
         let path = self.schema_path(schema_id);
         let input = self.file_io.new_input(&path)?;
-        let bytes = input.read().await?;
+        let bytes = match input.read().await {
+            Ok(b) => b,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         let schema: TableSchema =
             serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to parse schema file: {path}"),
@@ -134,13 +155,12 @@ impl SchemaManager {
         }
         let schema = Arc::new(schema);
 
-        // Insert into shared cache (short lock).
         {
             let mut cache = self.cache.lock().unwrap();
             cache.entry(schema_id).or_insert_with(|| schema.clone());
         }
 
-        Ok(schema)
+        Ok(Some(schema))
     }
 }
 
@@ -155,9 +175,7 @@ mod tests {
     }
 
     async fn write_schema_marker(file_io: &FileIO, dir: &str, id: i64) {
-        let path = format!("{dir}/{SCHEMA_PREFIX}{id}");
-        let out = file_io.new_output(&path).unwrap();
-        out.write(Bytes::from("{}")).await.unwrap();
+        write_schema_file(file_io, dir, id, id).await;
     }
 
     #[tokio::test]

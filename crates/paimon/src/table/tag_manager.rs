@@ -20,24 +20,28 @@
 //! Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 //! and [pypaimon.tag.tag_manager.TagManager](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/tag/tag_manager.py).
 
-use crate::io::FileIO;
+use crate::io::{path_basename, FileIO};
 use crate::spec::Snapshot;
+use crate::table::LIST_FETCH_CONCURRENCY;
 
 use futures::{StreamExt, TryStreamExt};
-use opendal::raw::get_basename;
 use serde::{Deserialize, Serialize};
 
 const TAG_DIR: &str = "tag";
 const TAG_PREFIX: &str = "tag-";
-const LIST_FETCH_CONCURRENCY: usize = 32;
 
-/// Snapshot extended with tag-specific metadata. Both tag fields are kept as
-/// raw strings to tolerate any format Java's `LocalDateTime.toString()` /
-/// ISO-8601 duration emits.
+/// Snapshot extended with tag-specific metadata. Tag time fields are kept as
+/// raw strings to tolerate Java's `LocalDateTime.toString()` / ISO-8601 output.
+///
+/// `#[serde(flatten)]` forbids `Snapshot` from using `deny_unknown_fields` and
+/// from adding fields named `tagCreateTime` / `tagTimeRetained`.
 ///
 /// Reference: [Tag.java](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/tag/Tag.java)
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Tag {
+    /// Populated from the file name after deserialization; absent in the JSON.
+    #[serde(skip, default)]
+    name: String,
     #[serde(flatten)]
     snapshot: Snapshot,
     #[serde(
@@ -55,6 +59,10 @@ pub struct Tag {
 }
 
 impl Tag {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
@@ -107,7 +115,7 @@ impl TagManager {
 
     /// List all tags sorted lexicographically by name. Tags deleted between
     /// the directory listing and the per-tag read are silently dropped.
-    pub async fn list_all(&self) -> crate::Result<Vec<(String, Tag)>> {
+    pub async fn list_all(&self) -> crate::Result<Vec<Tag>> {
         let statuses = self
             .file_io
             .list_status_or_empty(&self.tag_directory())
@@ -116,7 +124,7 @@ impl TagManager {
             .into_iter()
             .filter(|s| !s.is_dir)
             .filter_map(|s| {
-                get_basename(&s.path)
+                path_basename(&s.path)
                     .strip_prefix(TAG_PREFIX)
                     .map(String::from)
             })
@@ -124,12 +132,9 @@ impl TagManager {
         names.sort_unstable();
 
         futures::stream::iter(names)
-            .map(|name| async move {
-                let tag = self.get_tag(&name).await?;
-                Ok::<_, crate::Error>(tag.map(|t| (name, t)))
-            })
+            .map(|name| self.get_tag(name))
             .buffered(LIST_FETCH_CONCURRENCY)
-            .try_filter_map(|x| async move { Ok(x) })
+            .try_filter_map(|t| async move { Ok(t) })
             .try_collect()
             .await
     }
@@ -137,8 +142,9 @@ impl TagManager {
     /// Get the tag for a name, or None if the tag file does not exist.
     ///
     /// Reads directly and catches NotFound to avoid a separate exists() IO round-trip.
-    pub async fn get_tag(&self, tag_name: &str) -> crate::Result<Option<Tag>> {
-        let path = self.tag_path(tag_name);
+    pub async fn get_tag(&self, tag_name: impl Into<String>) -> crate::Result<Option<Tag>> {
+        let tag_name = tag_name.into();
+        let path = self.tag_path(&tag_name);
         let input = self.file_io.new_input(&path)?;
         let bytes = match input.read().await {
             Ok(b) => b,
@@ -149,10 +155,12 @@ impl TagManager {
             }
             Err(e) => return Err(e),
         };
-        let tag: Tag = serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
-            message: format!("tag '{tag_name}' JSON invalid: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+        let mut tag: Tag =
+            serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
+                message: format!("tag '{tag_name}' JSON invalid: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        tag.name = tag_name;
         Ok(Some(tag))
     }
 
@@ -161,7 +169,7 @@ impl TagManager {
         Ok(self.get_tag(tag_name).await?.map(|t| t.snapshot))
     }
 
-    #[deprecated(since = "0.2.0", note = "renamed to get_snapshot")]
+    #[deprecated(since = "0.1.0", note = "renamed to get_snapshot")]
     pub async fn get(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
         self.get_snapshot(tag_name).await
     }
@@ -228,7 +236,7 @@ mod tests {
 
         let tm = TagManager::new(file_io, table_path.to_string());
         let tags = tm.list_all().await.unwrap();
-        let names: Vec<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = tags.iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["alpha", "rc2", "v1"]);
     }
 
