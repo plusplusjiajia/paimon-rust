@@ -25,44 +25,12 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use paimon::catalog::{Catalog, Identifier, SYSTEM_BRANCH_PREFIX, SYSTEM_TABLE_SPLITTER};
+use paimon::catalog::{Catalog, Identifier};
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::system_tables;
 use crate::table::PaimonTableProvider;
-
-/// Parse a Paimon object name into `(base_table, optional system_table_name)`.
-///
-/// Mirrors Java [Identifier.splitObjectName](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java).
-///
-/// - `t` → `("t", None)`
-/// - `t$options` → `("t", Some("options"))`
-/// - `t$branch_main` → `("t", None)` (branch reference, not a system table)
-/// - `t$branch_main$options` → `("t", Some("options"))` (branch + system table)
-fn split_object_name(name: &str) -> (&str, Option<&str>) {
-    let mut parts = name.splitn(3, SYSTEM_TABLE_SPLITTER);
-    let base = parts.next().unwrap_or(name);
-    match (parts.next(), parts.next()) {
-        (None, _) => (base, None),
-        (Some(second), None) => {
-            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
-                (base, None)
-            } else {
-                (base, Some(second))
-            }
-        }
-        (Some(second), Some(third)) => {
-            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
-                (base, Some(third))
-            } else {
-                // `$` is legal in table names, so `t$foo$bar` falls through as
-                // plain `t` and errors later as "table not found".
-                (base, None)
-            }
-        }
-    }
-}
 
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
@@ -163,7 +131,7 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let (base, system_name) = split_object_name(name);
+        let (base, system_name) = system_tables::split_object_name(name);
         if let Some(system_name) = system_name {
             return await_with_runtime(system_tables::load(
                 Arc::clone(&self.catalog),
@@ -190,7 +158,7 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let (base, system_name) = split_object_name(name);
+        let (base, system_name) = system_tables::split_object_name(name);
         if let Some(system_name) = system_name {
             if !system_tables::is_registered(system_name) {
                 return false;
@@ -209,50 +177,5 @@ impl SchemaProvider for PaimonSchemaProvider {
             },
             "paimon catalog access thread panicked",
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split_object_name;
-
-    #[test]
-    fn plain_table_name() {
-        assert_eq!(split_object_name("orders"), ("orders", None));
-    }
-
-    #[test]
-    fn system_table_only() {
-        assert_eq!(
-            split_object_name("orders$options"),
-            ("orders", Some("options"))
-        );
-    }
-
-    #[test]
-    fn branch_reference_is_not_a_system_table() {
-        assert_eq!(split_object_name("orders$branch_main"), ("orders", None));
-    }
-
-    #[test]
-    fn branch_plus_system_table() {
-        assert_eq!(
-            split_object_name("orders$branch_main$options"),
-            ("orders", Some("options"))
-        );
-    }
-
-    #[test]
-    fn three_parts_without_branch_prefix_is_not_a_system_table() {
-        assert_eq!(split_object_name("orders$foo$bar"), ("orders", None));
-    }
-
-    #[test]
-    fn system_table_name_preserves_case() {
-        // Case-insensitive matching is `system_tables::is_registered`'s job.
-        assert_eq!(
-            split_object_name("orders$Options"),
-            ("orders", Some("Options"))
-        );
     }
 }

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::{Catalog, Identifier, SYSTEM_BRANCH_PREFIX, SYSTEM_TABLE_SPLITTER};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -34,6 +34,38 @@ mod options;
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
 const TABLES: &[(&str, Builder)] = &[("options", options::build)];
+
+/// Parse a Paimon object name into `(base_table, optional system_table_name)`.
+///
+/// Mirrors Java [Identifier.splitObjectName](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java).
+///
+/// - `t` → `("t", None)`
+/// - `t$options` → `("t", Some("options"))`
+/// - `t$branch_main` → `("t", None)` (branch reference, not a system table)
+/// - `t$branch_main$options` → `("t", Some("options"))` (branch + system table)
+pub(crate) fn split_object_name(name: &str) -> (&str, Option<&str>) {
+    let mut parts = name.splitn(3, SYSTEM_TABLE_SPLITTER);
+    let base = parts.next().unwrap_or(name);
+    match (parts.next(), parts.next()) {
+        (None, _) => (base, None),
+        (Some(second), None) => {
+            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
+                (base, None)
+            } else {
+                (base, Some(second))
+            }
+        }
+        (Some(second), Some(third)) => {
+            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
+                (base, Some(third))
+            } else {
+                // `$` is legal in table names, so `t$foo$bar` falls through as
+                // plain `t` and errors later as "table not found".
+                (base, None)
+            }
+        }
+    }
+}
 
 /// Returns true if `name` is a recognised Paimon system table suffix.
 pub(crate) fn is_registered(name: &str) -> bool {
@@ -78,7 +110,7 @@ pub(crate) async fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::is_registered;
+    use super::{is_registered, split_object_name};
 
     #[test]
     fn is_registered_is_case_insensitive() {
@@ -86,5 +118,44 @@ mod tests {
         assert!(is_registered("Options"));
         assert!(is_registered("OPTIONS"));
         assert!(!is_registered("nonsense"));
+    }
+
+    #[test]
+    fn plain_table_name() {
+        assert_eq!(split_object_name("orders"), ("orders", None));
+    }
+
+    #[test]
+    fn system_table_only() {
+        assert_eq!(
+            split_object_name("orders$options"),
+            ("orders", Some("options"))
+        );
+    }
+
+    #[test]
+    fn branch_reference_is_not_a_system_table() {
+        assert_eq!(split_object_name("orders$branch_main"), ("orders", None));
+    }
+
+    #[test]
+    fn branch_plus_system_table() {
+        assert_eq!(
+            split_object_name("orders$branch_main$options"),
+            ("orders", Some("options"))
+        );
+    }
+
+    #[test]
+    fn three_parts_without_branch_prefix_is_not_a_system_table() {
+        assert_eq!(split_object_name("orders$foo$bar"), ("orders", None));
+    }
+
+    #[test]
+    fn system_table_name_preserves_case() {
+        assert_eq!(
+            split_object_name("orders$Options"),
+            ("orders", Some("Options"))
+        );
     }
 }
