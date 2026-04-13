@@ -145,43 +145,6 @@ impl PaimonSchemaProvider {
     pub fn new(catalog: Arc<dyn Catalog>, database: String) -> Self {
         PaimonSchemaProvider { catalog, database }
     }
-
-    /// Resolves `<base>$<system_name>` into a system table provider.
-    ///
-    /// Unknown system names return `Ok(None)` (DataFusion reports "table not
-    /// found"). When the system name is registered but the base table is
-    /// missing, an explicit error is returned so users can tell the two cases
-    /// apart in error messages.
-    async fn load_system_table(
-        &self,
-        base: &str,
-        system_name: &str,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        if !system_tables::is_registered(system_name) {
-            return Ok(None);
-        }
-
-        let catalog = Arc::clone(&self.catalog);
-        let database = self.database.clone();
-        let base_owned = base.to_string();
-        let system_name_owned = system_name.to_string();
-        await_with_runtime(async move {
-            let identifier = Identifier::new(database, base_owned.clone());
-            match catalog.get_table(&identifier).await {
-                Ok(table) => system_tables::build(&system_name_owned, table)
-                    .expect("is_registered guarantees a builder")
-                    .map(Some),
-                Err(paimon::Error::TableNotExist { .. }) => {
-                    Err(datafusion::error::DataFusionError::Plan(format!(
-                        "Cannot read system table `${system_name_owned}`: \
-                         base table `{base_owned}` does not exist"
-                    )))
-                }
-                Err(e) => Err(to_datafusion_error(e)),
-            }
-        })
-        .await
-    }
 }
 
 #[async_trait]
@@ -202,7 +165,13 @@ impl SchemaProvider for PaimonSchemaProvider {
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let (base, system_name) = split_object_name(name);
         if let Some(system_name) = system_name {
-            return self.load_system_table(base, system_name).await;
+            return await_with_runtime(system_tables::load(
+                Arc::clone(&self.catalog),
+                self.database.clone(),
+                base.to_string(),
+                system_name.to_string(),
+            ))
+            .await;
         }
 
         let catalog = Arc::clone(&self.catalog);
@@ -221,8 +190,6 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Malformed `t$foo$bar` (no `branch_` segment) falls through as plain `t`,
-        // matching `table()`.
         let (base, system_name) = split_object_name(name);
         if let Some(system_name) = system_name {
             if !system_tables::is_registered(system_name) {
@@ -278,5 +245,14 @@ mod tests {
     #[test]
     fn three_parts_without_branch_prefix_is_not_a_system_table() {
         assert_eq!(split_object_name("orders$foo$bar"), ("orders", None));
+    }
+
+    #[test]
+    fn system_table_name_preserves_case() {
+        // Case-insensitive matching is `system_tables::is_registered`'s job.
+        assert_eq!(
+            split_object_name("orders$Options"),
+            ("orders", Some("Options"))
+        );
     }
 }
