@@ -26,7 +26,7 @@ use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
-use crate::table::Table;
+use crate::table::{SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opendal::raw::get_basename;
@@ -167,36 +167,8 @@ impl FileSystemCatalog {
 
     /// Load the latest schema for a table (highest schema-{version} file under table_path/schema).
     async fn load_latest_table_schema(&self, table_path: &str) -> Result<Option<TableSchema>> {
-        let schema_dir = self.schema_dir_path(table_path);
-        if !self.file_io.exists(&schema_dir).await? {
-            return Ok(None);
-        }
-        let statuses = self.file_io.list_status(&schema_dir).await?;
-
-        let latest_schema_id = statuses
-            .into_iter()
-            .filter(|s| !s.is_dir)
-            .filter_map(|s| {
-                get_basename(s.path.as_str())
-                    .strip_prefix(SCHEMA_PREFIX)?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .max();
-
-        if let Some(schema_id) = latest_schema_id {
-            let schema_path = self.schema_file_path(table_path, schema_id);
-            let input_file = self.file_io.new_input(&schema_path)?;
-            let content = input_file.read().await?;
-            let schema: TableSchema =
-                serde_json::from_slice(&content).map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to parse schema file: {schema_path}"),
-                    source: Some(Box::new(e)),
-                })?;
-            return Ok(Some(schema));
-        }
-
-        Ok(None)
+        let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
+        Ok(manager.latest().await?.map(|arc| (*arc).clone()))
     }
 
     /// Save a table schema to a file.
