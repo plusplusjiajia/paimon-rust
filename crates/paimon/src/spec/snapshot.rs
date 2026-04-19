@@ -35,6 +35,17 @@ pub enum CommitKind {
     ANALYZE,
 }
 
+impl std::fmt::Display for CommitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::APPEND => write!(f, "APPEND"),
+            Self::COMPACT => write!(f, "COMPACT"),
+            Self::OVERWRITE => write!(f, "OVERWRITE"),
+            Self::ANALYZE => write!(f, "ANALYZE"),
+        }
+    }
+}
+
 /// Snapshot for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L68>.

@@ -251,3 +251,83 @@ async fn test_missing_base_table_for_system_table_errors() {
         "expected error to mention both base table and system name, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn test_snapshots_system_table() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$snapshots");
+    let batches = run_sql(&ctx, &sql).await;
+
+    assert!(!batches.is_empty(), "$snapshots should return ≥1 batch");
+
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("snapshot_id", DataType::Int64),
+        ("schema_id", DataType::Int64),
+        ("commit_user", DataType::Utf8),
+        ("commit_identifier", DataType::Int64),
+        ("commit_kind", DataType::Utf8),
+        (
+            "commit_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("base_manifest_list", DataType::Utf8),
+        ("delta_manifest_list", DataType::Utf8),
+        ("changelog_manifest_list", DataType::Utf8),
+        ("total_record_count", DataType::Int64),
+        ("delta_record_count", DataType::Int64),
+        ("changelog_record_count", DataType::Int64),
+        ("watermark", DataType::Int64),
+        ("next_row_id", DataType::Int64),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    // Row count must match the snapshot directory listing.
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("fixture table should load");
+    let sm =
+        paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let all = sm.list_all().await.expect("list_all should succeed");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows,
+        all.len(),
+        "$snapshots rows should match list_all() length"
+    );
+
+    // snapshot_id column must be ascending.
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("snapshot_id is Int64");
+        for i in 0..batch.num_rows() {
+            ids.push(col.value(i));
+        }
+    }
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "snapshot_id should be ascending");
+
+    // commit_kind column must contain a known variant.
+    let last_batch = batches.last().unwrap();
+    let kind_col = last_batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("commit_kind is Utf8");
+    let kind = kind_col.value(last_batch.num_rows() - 1);
+    assert!(
+        ["APPEND", "COMPACT", "OVERWRITE", "ANALYZE"].contains(&kind),
+        "unexpected commit_kind: {kind}"
+    );
+}

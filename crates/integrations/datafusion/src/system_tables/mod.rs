@@ -31,10 +31,15 @@ use crate::error::to_datafusion_error;
 
 mod options;
 mod schemas;
+mod snapshots;
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
-const TABLES: &[(&str, Builder)] = &[("options", options::build), ("schemas", schemas::build)];
+const TABLES: &[(&str, Builder)] = &[
+    ("options", options::build),
+    ("schemas", schemas::build),
+    ("snapshots", snapshots::build),
+];
 
 /// Parse a Paimon object name into `(base_table, optional system_table_name)`.
 ///
