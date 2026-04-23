@@ -91,20 +91,26 @@ impl SnapshotManager {
         id_str.trim().parse().ok()
     }
 
-    /// Scan the snapshot directory and collect all `snapshot-{id}` ids, sorted
-    /// ascending.
-    async fn collect_snapshot_ids(&self) -> crate::Result<Vec<i64>> {
-        let statuses = self.file_io.list_status(&self.snapshot_dir()).await?;
-        let mut ids: Vec<i64> = statuses
-            .into_iter()
-            .filter(|s| !s.is_dir)
-            .filter_map(|s| {
-                let name = s.path.rsplit('/').next().unwrap_or(&s.path);
-                name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<i64>().ok()
-            })
-            .collect();
-        ids.sort_unstable();
-        Ok(ids)
+    /// List snapshot files and find the id using the given reducer (min or max).
+    async fn find_by_list_files(&self, reducer: fn(i64, i64) -> i64) -> crate::Result<Option<i64>> {
+        let snapshot_dir = self.snapshot_dir();
+        let statuses = self.file_io.list_status(&snapshot_dir).await?;
+        let mut result: Option<i64> = None;
+        for status in statuses {
+            if status.is_dir {
+                continue;
+            }
+            let name = status.path.rsplit('/').next().unwrap_or(&status.path);
+            if let Some(id_str) = name.strip_prefix(SNAPSHOT_PREFIX) {
+                if let Ok(id) = id_str.parse::<i64>() {
+                    result = Some(match result {
+                        Some(r) => reducer(r, id),
+                        None => id,
+                    });
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Get the latest snapshot id.
@@ -124,7 +130,7 @@ impl SnapshotManager {
                 }
             }
         }
-        Ok(self.collect_snapshot_ids().await?.into_iter().max())
+        self.find_by_list_files(i64::max).await
     }
 
     /// Get the earliest snapshot id.
@@ -142,12 +148,23 @@ impl SnapshotManager {
                 return Ok(Some(hint_id));
             }
         }
-        Ok(self.collect_snapshot_ids().await?.into_iter().min())
+        self.find_by_list_files(i64::min).await
     }
 
     /// List all snapshot ids sorted ascending.
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
-        self.collect_snapshot_ids().await
+        let snapshot_dir = self.snapshot_dir();
+        let statuses = self.file_io.list_status(&snapshot_dir).await?;
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                let name = s.path.rsplit('/').next().unwrap_or(&s.path);
+                name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<i64>().ok()
+            })
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     /// List all snapshots sorted by id ascending.
