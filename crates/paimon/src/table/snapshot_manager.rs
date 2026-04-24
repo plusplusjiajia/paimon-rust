@@ -151,10 +151,19 @@ impl SnapshotManager {
         self.find_by_list_files(i64::min).await
     }
 
-    /// List all snapshot ids sorted ascending.
+    /// List all snapshot ids sorted ascending. Returns an empty vector when
+    /// the snapshot directory does not exist.
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
         let snapshot_dir = self.snapshot_dir();
-        let statuses = self.file_io.list_status(&snapshot_dir).await?;
+        let statuses = match self.file_io.list_status(&snapshot_dir).await {
+            Ok(s) => s,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
         let mut ids: Vec<i64> = statuses
             .into_iter()
             .filter(|s| !s.is_dir)
@@ -394,6 +403,14 @@ mod tests {
     async fn test_list_all_ids_empty() {
         let (_, sm) = setup("memory:/test_list_empty").await;
         assert!(sm.list_all_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_missing_dir_returns_empty() {
+        let file_io = test_file_io();
+        let sm = SnapshotManager::new(file_io, "memory:/test_list_missing".to_string());
+        assert!(sm.list_all_ids().await.unwrap().is_empty());
+        assert!(sm.list_all().await.unwrap().is_empty());
     }
 
     #[tokio::test]
