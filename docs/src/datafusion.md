@@ -423,6 +423,73 @@ Columns:
 | `comment` | STRING | Comment |
 | `update_time` | TIMESTAMP | Update time |
 
+### $snapshots
+
+View the snapshot history of a table:
+
+```sql
+SELECT * FROM paimon.default.my_table$snapshots;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `snapshot_id` | BIGINT | Snapshot ID |
+| `schema_id` | BIGINT | Schema ID |
+| `commit_user` | STRING | Commit user |
+| `commit_identifier` | BIGINT | Commit identifier |
+| `commit_kind` | STRING | `APPEND` / `COMPACT` / `OVERWRITE` / `ANALYZE` |
+| `commit_time` | TIMESTAMP | Commit time |
+| `base_manifest_list` | STRING | Base manifest list file |
+| `delta_manifest_list` | STRING | Delta manifest list file |
+| `changelog_manifest_list` | STRING | Changelog manifest list file |
+| `total_record_count` | BIGINT | Total record count |
+| `delta_record_count` | BIGINT | Delta record count |
+| `changelog_record_count` | BIGINT | Changelog record count |
+| `watermark` | BIGINT | Watermark |
+| `next_row_id` | BIGINT | Next row id |
+
+### $tags
+
+View all named tags of a table:
+
+```sql
+SELECT * FROM paimon.default.my_table$tags;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `tag_name` | STRING | Tag name |
+| `snapshot_id` | BIGINT | Snapshot ID |
+| `schema_id` | BIGINT | Schema ID |
+| `commit_time` | TIMESTAMP | Commit time |
+| `record_count` | BIGINT | Record count |
+| `create_time` | TIMESTAMP | Tag creation time |
+| `time_retained` | STRING | Retention duration |
+
+### $manifests
+
+View manifest files of the latest snapshot:
+
+```sql
+SELECT * FROM paimon.default.my_table$manifests;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `file_name` | STRING | Manifest file name |
+| `file_size` | BIGINT | File size in bytes |
+| `num_added_files` | BIGINT | Number of added data files |
+| `num_deleted_files` | BIGINT | Number of deleted data files |
+| `schema_id` | BIGINT | Schema ID |
+| `min_partition_stats` | STRING | Min partition values |
+| `max_partition_stats` | STRING | Max partition values |
+
 ### Branch References
 
 System tables support branch syntax:
