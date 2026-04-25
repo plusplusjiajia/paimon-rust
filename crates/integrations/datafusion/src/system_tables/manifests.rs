@@ -132,7 +132,9 @@ async fn collect_manifests(table: &Table) -> paimon::Result<Vec<ManifestFileMeta
 
     let base_path = sm.manifest_path(snapshot.base_manifest_list());
     let delta_path = sm.manifest_path(snapshot.delta_manifest_list());
-    let changelog_path = snapshot.changelog_manifest_list().map(|c| sm.manifest_path(c));
+    let changelog_path = snapshot
+        .changelog_manifest_list()
+        .map(|c| sm.manifest_path(c));
     let base_fut = ManifestList::read(file_io, &base_path);
     let delta_fut = ManifestList::read(file_io, &delta_path);
     let changelog_fut = async {
