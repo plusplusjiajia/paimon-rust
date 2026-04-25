@@ -427,6 +427,8 @@ async fn test_manifests_system_table() {
         ("schema_id", DataType::Int64),
         ("min_partition_stats", DataType::Utf8),
         ("max_partition_stats", DataType::Utf8),
+        ("min_row_id", DataType::Int64),
+        ("max_row_id", DataType::Int64),
     ];
     for (i, (name, dtype)) in expected_columns.iter().enumerate() {
         let field = arrow_schema.field(i);
@@ -437,7 +439,6 @@ async fn test_manifests_system_table() {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(total_rows > 0, "fixture should have at least one manifest");
 
-    // file_name must be non-empty for every row.
     for batch in &batches {
         let names = batch
             .column(0)
@@ -455,7 +456,6 @@ async fn test_manifests_system_table() {
         }
     }
 
-    // Row count must equal base + delta + changelog manifest entries of the latest snapshot.
     let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
     let table = catalog.get_table(&identifier).await.unwrap();
     let sm =

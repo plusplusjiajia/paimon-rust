@@ -489,6 +489,8 @@ Columns:
 | `schema_id` | BIGINT | Schema ID |
 | `min_partition_stats` | STRING | Min partition values |
 | `max_partition_stats` | STRING | Max partition values |
+| `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
+| `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
 
 ### Branch References
 

@@ -33,6 +33,8 @@ impl AvroRecordDecode for ManifestFileMeta {
         let mut num_deleted_files: Option<i64> = None;
         let mut partition_stats: Option<BinaryTableStats> = None;
         let mut schema_id: Option<i64> = None;
+        let mut min_row_id: Option<i64> = None;
+        let mut max_row_id: Option<i64> = None;
 
         for field in &writer_schema.fields {
             match field.name.as_str() {
@@ -50,6 +52,8 @@ impl AvroRecordDecode for ManifestFileMeta {
                         decode_nullable_binary_table_stats(cursor, &field.schema, field.nullable)?;
                 }
                 "_SCHEMA_ID" => schema_id = Some(read_long_field(cursor, field.nullable)?),
+                "_MIN_ROW_ID" => min_row_id = read_optional_long(cursor, field.nullable)?,
+                "_MAX_ROW_ID" => max_row_id = read_optional_long(cursor, field.nullable)?,
                 _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
             }
         }
@@ -62,8 +66,20 @@ impl AvroRecordDecode for ManifestFileMeta {
             num_deleted_files.unwrap_or(0),
             partition_stats.unwrap_or_else(|| BinaryTableStats::new(vec![], vec![], vec![])),
             schema_id.unwrap_or(0),
+            min_row_id,
+            max_row_id,
         ))
     }
+}
+
+fn read_optional_long(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<i64>> {
+    if nullable {
+        let idx = cursor.read_union_index()?;
+        if idx == 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(cursor.read_long()?))
 }
 
 /// Decode a nullable BinaryTableStats: union ["null", record] or direct record.

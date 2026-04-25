@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Mirrors Java [ManifestsTable](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/system/ManifestsTable.java).
+//! Mirrors Java [ManifestsTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system/ManifestsTable.java).
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
@@ -50,6 +50,8 @@ fn manifests_schema() -> SchemaRef {
                 Field::new("schema_id", DataType::Int64, false),
                 Field::new("min_partition_stats", DataType::Utf8, true),
                 Field::new("max_partition_stats", DataType::Utf8, true),
+                Field::new("min_row_id", DataType::Int64, true),
+                Field::new("max_row_id", DataType::Int64, true),
             ]))
         })
         .clone()
@@ -91,6 +93,8 @@ impl TableProvider for ManifestsTable {
         let mut num_added = Vec::with_capacity(n);
         let mut num_deleted = Vec::with_capacity(n);
         let mut schema_ids = Vec::with_capacity(n);
+        let mut min_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
+        let mut max_row_ids: Vec<Option<i64>> = Vec::with_capacity(n);
 
         for meta in metas {
             file_names.push(meta.file_name().to_string());
@@ -98,6 +102,8 @@ impl TableProvider for ManifestsTable {
             num_added.push(meta.num_added_files());
             num_deleted.push(meta.num_deleted_files());
             schema_ids.push(meta.schema_id());
+            min_row_ids.push(meta.min_row_id());
+            max_row_ids.push(meta.max_row_id());
         }
 
         let schema = manifests_schema();
@@ -111,6 +117,8 @@ impl TableProvider for ManifestsTable {
                 Arc::new(Int64Array::from(schema_ids)),
                 new_null_array(&DataType::Utf8, n),
                 new_null_array(&DataType::Utf8, n),
+                Arc::new(Int64Array::from(min_row_ids)),
+                Arc::new(Int64Array::from(max_row_ids)),
             ],
         )?;
 

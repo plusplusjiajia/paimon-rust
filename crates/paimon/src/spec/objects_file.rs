@@ -71,6 +71,29 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_manifest_file_meta_with_row_ids() {
+        let value_bytes = vec![
+            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129,
+        ];
+        let original = vec![ManifestFileMeta::new_with_version(
+            2,
+            "manifest-row-tracking-0".to_string(),
+            2048,
+            7,
+            0,
+            BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1)]),
+            0,
+            Some(100),
+            Some(199),
+        )];
+        let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
+        let decoded = from_avro_bytes::<ManifestFileMeta>(&bytes).unwrap();
+        assert_eq!(original, decoded);
+        assert_eq!(decoded[0].min_row_id(), Some(100));
+        assert_eq!(decoded[0].max_row_id(), Some(199));
+    }
+
+    #[test]
     fn test_roundtrip_manifest_entry() {
         let value_bytes = vec![
             0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129, 1, 0, 0, 0, 0, 0, 0, 0,

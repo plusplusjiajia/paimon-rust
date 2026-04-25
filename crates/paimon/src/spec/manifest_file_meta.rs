@@ -50,6 +50,22 @@ pub struct ManifestFileMeta {
     /// schema id when writing this manifest file.
     #[serde(rename = "_SCHEMA_ID")]
     schema_id: i64,
+
+    /// minimum row id covered by this manifest, when row tracking is enabled.
+    #[serde(
+        rename = "_MIN_ROW_ID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    min_row_id: Option<i64>,
+
+    /// maximum row id covered by this manifest, when row tracking is enabled.
+    #[serde(
+        rename = "_MAX_ROW_ID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_row_id: Option<i64>,
 }
 
 impl ManifestFileMeta {
@@ -94,6 +110,18 @@ impl ManifestFileMeta {
         self.version
     }
 
+    /// Get the minimum row id covered by this manifest (None when row tracking is disabled).
+    #[inline]
+    pub fn min_row_id(&self) -> Option<i64> {
+        self.min_row_id
+    }
+
+    /// Get the maximum row id covered by this manifest (None when row tracking is disabled).
+    #[inline]
+    pub fn max_row_id(&self) -> Option<i64> {
+        self.max_row_id
+    }
+
     #[inline]
     pub fn new(
         file_name: String,
@@ -111,10 +139,13 @@ impl ManifestFileMeta {
             num_deleted_files,
             partition_stats,
             schema_id,
+            min_row_id: None,
+            max_row_id: None,
         }
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_version(
         version: i32,
         file_name: String,
@@ -123,6 +154,8 @@ impl ManifestFileMeta {
         num_deleted_files: i64,
         partition_stats: BinaryTableStats,
         schema_id: i64,
+        min_row_id: Option<i64>,
+        max_row_id: Option<i64>,
     ) -> ManifestFileMeta {
         Self {
             version,
@@ -132,6 +165,8 @@ impl ManifestFileMeta {
             num_deleted_files,
             partition_stats,
             schema_id,
+            min_row_id,
+            max_row_id,
         }
     }
 }
@@ -156,7 +191,9 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
                 {"name": "_NULL_COUNTS", "type": ["null", {"type": "array", "items": ["null", "long"]}], "default": null}
             ]
         }], "default": null},
-        {"name": "_SCHEMA_ID", "type": "long"}
+        {"name": "_SCHEMA_ID", "type": "long"},
+        {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
+        {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null}
     ]
 }]"#;
 
