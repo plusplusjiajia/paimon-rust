@@ -29,6 +29,7 @@ use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
+mod manifests;
 mod options;
 mod schemas;
 mod snapshots;
@@ -37,6 +38,7 @@ mod tags;
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
 const TABLES: &[(&str, Builder)] = &[
+    ("manifests", manifests::build),
     ("options", options::build),
     ("schemas", schemas::build),
     ("snapshots", snapshots::build),
@@ -131,6 +133,9 @@ mod tests {
         assert!(is_registered("tags"));
         assert!(is_registered("Tags"));
         assert!(is_registered("TAGS"));
+        assert!(is_registered("manifests"));
+        assert!(is_registered("Manifests"));
+        assert!(is_registered("MANIFESTS"));
         assert!(!is_registered("nonsense"));
     }
 

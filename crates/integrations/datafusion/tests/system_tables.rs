@@ -410,3 +410,83 @@ async fn test_tags_system_table_with_seeded_tags() {
     assert_eq!(names, vec!["v1".to_string(), "v2".to_string()]);
     assert_eq!(snap_ids, vec![earliest.id(), earliest.id()]);
 }
+
+#[tokio::test]
+async fn test_manifests_system_table() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$manifests");
+    let batches = run_sql(&ctx, &sql).await;
+
+    assert!(!batches.is_empty(), "$manifests should return ≥1 batch");
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("file_name", DataType::Utf8),
+        ("file_size", DataType::Int64),
+        ("num_added_files", DataType::Int64),
+        ("num_deleted_files", DataType::Int64),
+        ("schema_id", DataType::Int64),
+        ("min_partition_stats", DataType::Utf8),
+        ("max_partition_stats", DataType::Utf8),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "fixture should have at least one manifest");
+
+    // file_name must be non-empty for every row.
+    for batch in &batches {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file_name is Utf8");
+        let sizes = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("file_size is Int64");
+        for i in 0..batch.num_rows() {
+            assert!(!names.value(i).is_empty(), "file_name must be non-empty");
+            assert!(sizes.value(i) >= 0, "file_size must be non-negative");
+        }
+    }
+
+    // Row count must equal base + delta + changelog manifest entries of the latest snapshot.
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let sm =
+        paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let latest = sm
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .expect("fixture has snapshots");
+    let mut expected = paimon::spec::ManifestList::read(
+        table.file_io(),
+        &sm.manifest_path(latest.base_manifest_list()),
+    )
+    .await
+    .unwrap()
+    .len();
+    expected += paimon::spec::ManifestList::read(
+        table.file_io(),
+        &sm.manifest_path(latest.delta_manifest_list()),
+    )
+    .await
+    .unwrap()
+    .len();
+    if let Some(changelog) = latest.changelog_manifest_list() {
+        expected += paimon::spec::ManifestList::read(table.file_io(), &sm.manifest_path(changelog))
+            .await
+            .unwrap()
+            .len();
+    }
+    assert_eq!(
+        total_rows, expected,
+        "$manifests rows should match base + delta + changelog manifest entries of the latest snapshot"
+    );
+}
