@@ -331,3 +331,85 @@ async fn test_snapshots_system_table() {
         "unexpected commit_kind: {kind}"
     );
 }
+
+#[tokio::test]
+async fn test_tags_system_table_empty_when_no_tag_dir() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$tags");
+    let batches = run_sql(&ctx, &sql).await;
+
+    // Schema must be present even with zero rows.
+    assert!(!batches.is_empty(), "$tags should return ≥1 batch");
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("tag_name", DataType::Utf8),
+        ("snapshot_id", DataType::Int64),
+        ("schema_id", DataType::Int64),
+        (
+            "commit_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("record_count", DataType::Int64),
+        (
+            "create_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("time_retained", DataType::Utf8),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0, "fixture has no tag dir, expected 0 rows");
+}
+
+#[tokio::test]
+async fn test_tags_system_table_with_seeded_tags() {
+    let (ctx, catalog, tmp) = create_context().await;
+
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let sm =
+        paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let earliest = sm.list_all().await.unwrap().into_iter().next().unwrap();
+
+    let table_dir = tmp.path().join("default.db").join(FIXTURE_TABLE);
+    let tag_dir = table_dir.join("tag");
+    std::fs::create_dir_all(&tag_dir).expect("create tag dir");
+    let src = table_dir
+        .join("snapshot")
+        .join(format!("snapshot-{}", earliest.id()));
+    std::fs::copy(&src, tag_dir.join("tag-v1")).unwrap();
+    std::fs::copy(&src, tag_dir.join("tag-v2")).unwrap();
+
+    let sql = format!("SELECT tag_name, snapshot_id FROM paimon.default.{FIXTURE_TABLE}$tags");
+    let batches = run_sql(&ctx, &sql).await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "expected two seeded tags");
+
+    let mut names: Vec<String> = Vec::new();
+    let mut snap_ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let names_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("tag_name is Utf8");
+        let snap_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("snapshot_id is Int64");
+        for i in 0..batch.num_rows() {
+            names.push(names_col.value(i).to_string());
+            snap_ids.push(snap_col.value(i));
+        }
+    }
+    let mut sorted_names = names.clone();
+    sorted_names.sort();
+    assert_eq!(names, sorted_names, "tag_name should be ascending");
+    assert_eq!(names, vec!["v1".to_string(), "v2".to_string()]);
+    assert_eq!(snap_ids, vec![earliest.id(), earliest.id()]);
+}

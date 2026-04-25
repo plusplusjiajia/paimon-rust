@@ -32,6 +32,7 @@ use crate::error::to_datafusion_error;
 mod options;
 mod schemas;
 mod snapshots;
+mod tags;
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
@@ -39,6 +40,7 @@ const TABLES: &[(&str, Builder)] = &[
     ("options", options::build),
     ("schemas", schemas::build),
     ("snapshots", snapshots::build),
+    ("tags", tags::build),
 ];
 
 /// Parse a Paimon object name into `(base_table, optional system_table_name)`.
@@ -126,6 +128,9 @@ mod tests {
         assert!(is_registered("schemas"));
         assert!(is_registered("Schemas"));
         assert!(is_registered("SCHEMAS"));
+        assert!(is_registered("tags"));
+        assert!(is_registered("Tags"));
+        assert!(is_registered("TAGS"));
         assert!(!is_registered("nonsense"));
     }
 
