@@ -23,6 +23,7 @@
 mod database;
 mod factory;
 mod filesystem;
+mod partition_listing;
 mod rest;
 
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ use std::fmt;
 pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
+pub use partition_listing::list_partitions_from_file_system;
 pub use rest::*;
 use serde::{Deserialize, Serialize};
 
@@ -229,12 +231,15 @@ pub trait Catalog: Send + Sync {
         ignore_if_not_exists: bool,
     ) -> Result<()>;
 
-    /// List partitions tracked by the catalog backend.
+    /// List partitions for a table.
     ///
-    /// Returns an empty `Vec` when the backend doesn't track partitions; callers
-    /// should fall back to scanning manifest entries.
-    async fn list_partitions(&self, _identifier: &Identifier) -> Result<Vec<Partition>> {
-        Ok(Vec::new())
+    /// Default impl scans the table's manifest entries via
+    /// [`list_partitions_from_file_system`], matching Java
+    /// `AbstractCatalog.listPartitions`. Catalogs with metastore-tracked
+    /// partitions (e.g. `RESTCatalog`) override to return audit fields too.
+    async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
+        let table = self.get_table(identifier).await?;
+        list_partitions_from_file_system(&table).await
     }
 
     /// Like [`Self::list_partitions`] but paged. Default impl ignores

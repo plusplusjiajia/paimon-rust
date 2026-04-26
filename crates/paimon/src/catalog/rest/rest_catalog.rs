@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::PagedList;
-use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP};
+use crate::catalog::{
+    list_partitions_from_file_system, Catalog, Database, Identifier, DB_LOCATION_PROP,
+};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::FileIO;
@@ -337,10 +339,12 @@ impl Catalog for RESTCatalog {
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.api.list_partitions(identifier).await {
             Ok(parts) => Ok(parts),
-            // Backend doesn't track partitions — caller falls back to manifest scan.
             Err(Error::RestApi {
                 source: RestError::NotImplemented { .. },
-            }) => Ok(Vec::new()),
+            }) => {
+                let table = self.get_table(identifier).await?;
+                list_partitions_from_file_system(&table).await
+            }
             Err(e) => Err(map_rest_error_for_table(e, identifier)),
         }
     }
@@ -359,7 +363,11 @@ impl Catalog for RESTCatalog {
             Ok(page) => Ok(page),
             Err(Error::RestApi {
                 source: RestError::NotImplemented { .. },
-            }) => Ok(PagedList::new(Vec::new(), None)),
+            }) => {
+                let table = self.get_table(identifier).await?;
+                let parts = list_partitions_from_file_system(&table).await?;
+                Ok(PagedList::new(parts, None))
+            }
             Err(e) => Err(map_rest_error_for_table(e, identifier)),
         }
     }

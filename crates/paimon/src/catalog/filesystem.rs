@@ -569,11 +569,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_partitions_default_returns_empty() {
+    async fn test_list_partitions_default_table_not_found_errors() {
         let (_temp_dir, catalog) = create_test_catalog();
-        let id = Identifier::new("any_db", "any_table");
+        let id = Identifier::new("nope_db", "nope_table");
+        let result = catalog.list_partitions(&id).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::DatabaseNotExist { .. } | Error::TableNotExist { .. })
+            ),
+            "expected TableNotExist/DatabaseNotExist, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_partitions_default_empty_table_returns_empty() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let id = Identifier::new("db1", "t1");
+        catalog
+            .create_table(&id, testing_schema(), false)
+            .await
+            .unwrap();
         let parts = catalog.list_partitions(&id).await.unwrap();
-        assert!(parts.is_empty(), "default impl should return empty Vec");
+        assert!(
+            parts.is_empty(),
+            "table without snapshots should yield no partitions"
+        );
     }
 
     /// Mirrors Java `CatalogTestBase.testListPartitionsPaged`: the default impl
@@ -581,7 +606,15 @@ mod tests {
     #[tokio::test]
     async fn test_list_partitions_paged_default_ignores_max_and_token() {
         let (_temp_dir, catalog) = create_test_catalog();
-        let id = Identifier::new("any_db", "any_table");
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let id = Identifier::new("db1", "t1");
+        catalog
+            .create_table(&id, testing_schema(), false)
+            .await
+            .unwrap();
         for (max_results, page_token) in [
             (None, None),
             (Some(2), None),
@@ -595,7 +628,7 @@ mod tests {
                 .unwrap();
             assert!(
                 page.elements.is_empty(),
-                "default impl returns same full result (empty for FS catalog) for max_results={max_results:?}, page_token={page_token:?}"
+                "empty table → empty page for max_results={max_results:?}, page_token={page_token:?}"
             );
             assert!(
                 page.next_page_token.is_none(),
