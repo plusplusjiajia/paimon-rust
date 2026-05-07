@@ -250,8 +250,12 @@ impl Catalog for RESTCatalog {
                 RESTTokenFileIO::new(identifier.clone(), table_path.clone(), self.options.clone());
             token_file_io.build_file_io().await?
         } else {
-            // Use standard FileIO from path
-            FileIO::from_path(&table_path)?.build()?
+            // Mirrors Java RESTCatalog.fileIOFromOptions: build FileIO from
+            // catalog options so OSS-backed paths can pick up the
+            // user-supplied `fs.oss.*` keys.
+            let mut builder = FileIO::from_path(&table_path)?;
+            builder = builder.with_props(self.options.to_map());
+            builder.build()?
         };
 
         let rest_env = RESTEnv::new(identifier.clone(), uuid, self.api.clone());
