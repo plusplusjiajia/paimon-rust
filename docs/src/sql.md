@@ -771,6 +771,30 @@ Columns:
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
 
+### $partitions
+
+View all partitions of a table with aggregated record counts and file sizes:
+
+```sql
+SELECT * FROM paimon.default.my_table$partitions;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `partition` | STRING | Partition spec, formatted as `key1=val1/key2=val2` |
+| `record_count` | BIGINT | Total record count across all data files in the partition |
+| `file_size_in_bytes` | BIGINT | Total file size in bytes |
+| `file_count` | BIGINT | Number of data files |
+| `last_update_time` | TIMESTAMP | Latest data-file creation time |
+| `created_at` | TIMESTAMP | Partition creation time (only available with metastore-tracked catalogs) |
+| `created_by` | STRING | Snapshot id that created the partition (catalog-tracked only) |
+| `updated_by` | STRING | Snapshot id that last updated the partition (catalog-tracked only) |
+| `options` | STRING | Per-partition options as flat JSON (catalog-tracked only) |
+| `total_buckets` | INT | Total bucket count for the partition (0 unless catalog-tracked) |
+| `done` | BOOLEAN | Whether the partition is marked done (false unless catalog-tracked) |
+
 ### Branch References
 
 System tables support branch syntax:
