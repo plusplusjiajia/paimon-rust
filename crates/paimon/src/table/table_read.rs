@@ -72,8 +72,20 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
+        // Fail closed: this client can't yet enforce query-auth row filtering / column masking,
+        // so refuse to read rather than return unfiltered data. Guarding this single data exit
+        // (not the `ReadBuilder`) makes the check non-bypassable.
+        if core_options.query_auth_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "reading a table with 'query-auth.enabled' = true is not supported: \
+                          the Rust client cannot yet enforce its row-level auth filter / column \
+                          masking, so it refuses to read to avoid returning unfiltered data"
+                    .to_string(),
+            });
+        }
+
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let merge_engine = core_options.merge_engine()?;
 
         // PK table with Deduplicate engine: splits that may hold multiple
@@ -237,6 +249,7 @@ mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
 
     fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
@@ -297,5 +310,20 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_direct_table_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        // Bypass `ReadBuilder` by constructing `TableRead` directly; the `to_arrow` guard
+        // still fails closed.
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        assert!(
+            matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "directly-constructed read of a query-auth.enabled table must fail closed"
+        );
     }
 }

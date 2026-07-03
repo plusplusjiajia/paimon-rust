@@ -334,7 +334,7 @@ mod tests {
     use crate::spec::{
         BinaryRow, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema, VarCharType,
     };
-    use crate::table::{DataSplitBuilder, Table};
+    use crate::table::{query_auth_table, DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
     use futures::TryStreamExt;
     use std::collections::HashSet;
@@ -396,6 +396,20 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        // Guard is at the read boundary (`to_arrow`): `new_read` succeeds, reading fails closed.
+        let read = table.new_read_builder().new_read().unwrap();
+        assert!(
+            matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "reading a query-auth.enabled table must fail closed"
+        );
     }
 
     #[test]

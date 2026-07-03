@@ -278,3 +278,28 @@ pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
     fields.iter().find(|f| f.name() == name).map(|f| f.id())
 }
+
+/// A minimal table with `query-auth.enabled = true`, for the fail-closed read guard.
+#[cfg(test)]
+pub(crate) fn query_auth_table() -> Table {
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    let file_io = FileIOBuilder::new("file").build().unwrap();
+    let table_schema = TableSchema::new(
+        0,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+    );
+    Table::new(
+        file_io,
+        Identifier::new("default", "auth_t"),
+        "/tmp/test-query-auth-table".to_string(),
+        table_schema,
+        None,
+    )
+}
