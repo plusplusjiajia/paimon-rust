@@ -31,9 +31,10 @@ use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
-    DataField, DataFileMeta, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate,
-    Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID,
-    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+    DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, ManifestEntry,
+    PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::merge_tree_split_generator::{
@@ -284,6 +285,20 @@ pub(super) fn can_push_down_limit_hint_for_scan(
     row_ranges: Option<&[RowRange]>,
 ) -> bool {
     data_predicates.is_empty() && row_ranges.is_none()
+}
+
+type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
+
+fn global_index_detail_data_ranges(groups: &BucketDataFileGroups) -> Vec<RowRange> {
+    let mut ranges = Vec::new();
+    for (_, data_files) in groups.values() {
+        for file in data_files {
+            if let Some((from, to)) = file.row_id_range() {
+                ranges.push(RowRange::new(from, to));
+            }
+        }
+    }
+    merge_row_ranges(ranges)
 }
 
 fn should_skip_level_zero_for_scan(
@@ -802,8 +817,7 @@ impl<'a> TableScan<'a> {
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
-        let mut groups: HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)> =
-            HashMap::with_capacity(entries.len());
+        let mut groups: BucketDataFileGroups = HashMap::with_capacity(entries.len());
         for e in entries {
             let (partition, bucket, total_buckets, file) = e.into_parts();
             let entry = groups
@@ -811,6 +825,23 @@ impl<'a> TableScan<'a> {
                 .or_insert_with(|| (total_buckets, Vec::new()));
             entry.1.push(file);
         }
+
+        let global_index_search_mode = if data_evolution_enabled
+            && core_options.global_index_enabled()
+            && !self.data_predicates.is_empty()
+        {
+            Some(core_options.global_index_search_mode()?)
+        } else {
+            None
+        };
+        let global_index_detail_data_ranges = if matches!(
+            global_index_search_mode,
+            Some(GlobalIndexSearchMode::Detail)
+        ) {
+            global_index_detail_data_ranges(&groups)
+        } else {
+            Vec::new()
+        };
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
@@ -856,16 +887,18 @@ impl<'a> TableScan<'a> {
                 // Use pushed-down row_ranges first; otherwise try global index.
                 let row_ranges = if self.row_ranges.is_some() {
                     self.row_ranges.clone()
-                } else if data_evolution_enabled
-                    && core_options.global_index_enabled()
-                    && !self.data_predicates.is_empty()
-                {
+                } else if let Some(search_mode) = global_index_search_mode {
                     super::global_index_scanner::evaluate_global_index(
-                        file_io,
-                        base_path,
-                        &index_entries,
-                        &self.data_predicates,
-                        self.table.schema().fields(),
+                        super::global_index_scanner::GlobalIndexEvaluation {
+                            file_io,
+                            table_path: base_path,
+                            index_entries: &index_entries,
+                            predicates: &self.data_predicates,
+                            schema_fields: self.table.schema().fields(),
+                            search_mode,
+                            next_row_id: snapshot.next_row_id(),
+                            data_ranges: &global_index_detail_data_ranges,
+                        },
                     )
                     .await?
                 } else {
