@@ -139,6 +139,10 @@ pub(crate) async fn load(
     let identifier = Identifier::new(database, base.clone());
     match catalog.get_table(&identifier).await {
         Ok(table) => {
+            // Fail closed: system tables expose file metadata the client can't authorize.
+            paimon::spec::CoreOptions::new(table.schema().options())
+                .ensure_read_authorized()
+                .map_err(to_datafusion_error)?;
             if system_name.eq_ignore_ascii_case("partitions") {
                 return partitions::build(catalog, identifier, table).map(Some);
             }

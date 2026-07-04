@@ -228,6 +228,9 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
+        // Fail closed at read construction so bindings that short-circuit before
+        // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
+        CoreOptions::new(self.table.schema.options()).ensure_read_authorized()?;
         let read_type = match &self.projected_fields {
             None => self.table.schema.fields().to_vec(),
             Some(projected) => self.resolve_projected_fields(projected)?,
@@ -337,7 +340,7 @@ mod tests {
     use crate::table::{query_auth_table, DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
     use futures::TryStreamExt;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
@@ -401,14 +404,25 @@ mod tests {
     #[test]
     fn test_read_fails_closed_when_query_auth_enabled() {
         let table = query_auth_table();
-        // Guard is at the read boundary (`to_arrow`): `new_read` succeeds, reading fails closed.
-        let read = table.new_read_builder().new_read().unwrap();
+        // `new_read` fails closed, so bindings that short-circuit before `to_arrow` can't bypass.
+        let err = table.new_read_builder().new_read().unwrap_err();
         assert!(
-            matches!(
-                read.to_arrow(&[]),
-                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
-            ),
-            "reading a query-auth.enabled table must fail closed"
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "building a read for a query-auth.enabled table must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_option_cannot_disable_query_auth() {
+        // Copying the table with the option off must not weaken a stored `true`.
+        let table = query_auth_table().copy_with_options(HashMap::from([(
+            "query-auth.enabled".to_string(),
+            "false".to_string(),
+        )]));
+        let err = table.new_read_builder().new_read().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "a dynamic override must not disable query-auth"
         );
     }
 

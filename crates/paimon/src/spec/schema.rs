@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::spec::core_options::{
-    first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION, SEQUENCE_FIELD_OPTION,
+    first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION,
+    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::{
@@ -130,7 +131,12 @@ impl TableSchema {
     }
 
     /// Create a copy of this schema with extra options merged in.
-    pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+    ///
+    /// A stored `query-auth.enabled = true` can't be turned off by a dynamic override.
+    pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
+        if CoreOptions::new(&self.options).query_auth_enabled() {
+            extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
+        }
         let mut new_schema = self.clone();
         new_schema.options.extend(extra);
         new_schema

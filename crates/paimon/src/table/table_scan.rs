@@ -667,22 +667,11 @@ impl<'a> TableScan<'a> {
         Ok((plan, trace))
     }
 
-    /// Fail closed for read scans of a `query-auth.enabled` table: planning would
-    /// leak splits, row counts, and stats the client can't authorize. Write scans
-    /// (`with_scan_all_files`) are allowed.
+    /// Fail closed for a `query-auth.enabled` table: scan planning — including
+    /// `with_scan_all_files`, which read-facing system tables like `files` use —
+    /// exposes file paths, row counts, and stats the client can't authorize.
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        if self.scan_all_files {
-            return Ok(());
-        }
-        if CoreOptions::new(self.table.schema().options()).query_auth_enabled() {
-            return Err(crate::Error::Unsupported {
-                message: "reading a table with 'query-auth.enabled' = true is not supported: \
-                          the Rust client cannot yet enforce its row-level auth filter / column \
-                          masking, so it refuses to read to avoid returning unfiltered data"
-                    .to_string(),
-            });
-        }
-        Ok(())
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
@@ -2588,8 +2577,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_fails_closed_when_query_auth_enabled() {
-        // Must fail closed at planning, not just `to_arrow`.
+        // Every scan-planning path must fail closed, including `with_scan_all_files`
+        // (read-facing system tables like `files` use it to expose metadata).
         let table = crate::table::query_auth_table();
+        let rb = table.new_read_builder();
+        for scan in [rb.new_scan(), rb.new_scan().with_scan_all_files()] {
+            let err = scan.plan().await.unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+                "scan planning must fail closed (scan_all_files or not)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_option_cannot_disable_query_auth_at_plan() {
+        // Copying the table with the option off must not weaken a stored `true`.
+        let table =
+            crate::table::query_auth_table().copy_with_options(std::collections::HashMap::from([
+                ("query-auth.enabled".to_string(), "false".to_string()),
+            ]));
         let err = table
             .new_read_builder()
             .new_scan()
@@ -2598,7 +2605,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
-            "scan planning of a query-auth.enabled table must fail closed"
+            "a dynamic override must not disable query-auth"
         );
     }
 }

@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
-const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
+pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
@@ -211,12 +211,27 @@ impl<'a> CoreOptions<'a> {
     /// Whether `query-auth.enabled` is set.
     ///
     /// When set, the server enforces a per-user row filter / column masking that this client
-    /// can't yet apply, so read paths fail closed (see `TableRead::to_arrow`).
+    /// can't yet apply, so read paths fail closed (see `ensure_read_authorized`).
     pub fn query_auth_enabled(&self) -> bool {
         self.options
             .get(QUERY_AUTH_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Fail closed when `query-auth.enabled` is set: this client can't enforce the row
+    /// filter / column masking, so refuse to read. Call at every read boundary (build,
+    /// plan, materialize) so no binding fast-path can bypass it.
+    pub fn ensure_read_authorized(&self) -> crate::Result<()> {
+        if self.query_auth_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "reading a table with 'query-auth.enabled' = true is not supported: \
+                          the Rust client cannot yet enforce its row-level auth filter / column \
+                          masking, so it refuses to read to avoid returning unfiltered data"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Returns the user-specified sequence field names, if configured.

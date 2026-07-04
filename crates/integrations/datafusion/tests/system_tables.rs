@@ -72,6 +72,41 @@ async fn run_sql(ctx: &SQLContext, sql: &str) -> Vec<RecordBatch> {
         .unwrap_or_else(|e| panic!("Failed to execute `{sql}`: {e}"))
 }
 
+// Error text of `sql`, whether it surfaces at planning or execution.
+async fn query_error(ctx: &SQLContext, sql: &str) -> String {
+    match ctx.sql(sql).await {
+        Err(e) => e.to_string(),
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err(&format!("`{sql}` must fail"))
+            .to_string(),
+    }
+}
+
+#[tokio::test]
+async fn test_query_auth_table_fails_closed() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.qa (id INT) WITH ('query-auth.enabled' = 'true')",
+    )
+    .await;
+
+    // Data reads and data-derived system tables must all fail closed.
+    for sql in [
+        "SELECT * FROM paimon.default.qa",
+        "SELECT * FROM paimon.default.qa$manifests",
+        "SELECT * FROM paimon.default.qa$table_indexes",
+    ] {
+        let err = query_error(&ctx, sql).await;
+        assert!(
+            err.contains("query-auth.enabled"),
+            "`{sql}` should fail closed, got: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_options_system_table() {
     let (ctx, catalog, _tmp) = create_context().await;

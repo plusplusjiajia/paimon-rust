@@ -95,6 +95,8 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
+        // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -919,6 +921,20 @@ mod tests {
             err.to_string()
                 .contains("Failed to read vindex index file 'missing.idx'"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_fails_closed_when_query_auth_enabled() {
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_vector_search_builder()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "vector search must fail closed for a query-auth table"
         );
     }
 

@@ -74,17 +74,8 @@ impl<'a> TableRead<'a> {
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
-        // Fail closed: this client can't yet enforce query-auth row filtering / column masking,
-        // so refuse to read rather than return unfiltered data. Guarding this single data exit
-        // (not the `ReadBuilder`) makes the check non-bypassable.
-        if core_options.query_auth_enabled() {
-            return Err(crate::Error::Unsupported {
-                message: "reading a table with 'query-auth.enabled' = true is not supported: \
-                          the Rust client cannot yet enforce its row-level auth filter / column \
-                          masking, so it refuses to read to avoid returning unfiltered data"
-                    .to_string(),
-            });
-        }
+        // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
+        core_options.ensure_read_authorized()?;
         let merge_engine = core_options.merge_engine()?;
 
         // PK table with Deduplicate engine: splits that may hold multiple
