@@ -634,6 +634,7 @@ impl<'a> TableScan<'a> {
     ///
     /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
     pub async fn plan(&self) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match self.resolve_snapshot().await? {
             Some(snapshot) => snapshot,
@@ -645,6 +646,7 @@ impl<'a> TableScan<'a> {
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+        self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut trace = ScanTrace {
             limit: self.limit,
@@ -663,6 +665,24 @@ impl<'a> TableScan<'a> {
             )
             .await?;
         Ok((plan, trace))
+    }
+
+    /// Fail closed for read scans of a `query-auth.enabled` table: planning would
+    /// leak splits, row counts, and stats the client can't authorize. Write scans
+    /// (`with_scan_all_files`) are allowed.
+    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
+        if self.scan_all_files {
+            return Ok(());
+        }
+        if CoreOptions::new(self.table.schema().options()).query_auth_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "reading a table with 'query-auth.enabled' = true is not supported: \
+                          the Rust client cannot yet enforce its row-level auth filter / column \
+                          masking, so it refuses to read to avoid returning unfiltered data"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
@@ -2564,5 +2584,21 @@ mod tests {
         assert_eq!(buckets.len(), 1);
         let bucket = *buckets.iter().next().unwrap();
         assert!((0..8).contains(&bucket));
+    }
+
+    #[tokio::test]
+    async fn test_plan_fails_closed_when_query_auth_enabled() {
+        // Must fail closed at planning, not just `to_arrow`.
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "scan planning of a query-auth.enabled table must fail closed"
+        );
     }
 }

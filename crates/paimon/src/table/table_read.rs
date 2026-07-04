@@ -72,6 +72,7 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
         // Fail closed: this client can't yet enforce query-auth row filtering / column masking,
         // so refuse to read rather than return unfiltered data. Guarding this single data exit
@@ -84,8 +85,6 @@ impl<'a> TableRead<'a> {
                     .to_string(),
             });
         }
-
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let merge_engine = core_options.merge_engine()?;
 
         // PK table with Deduplicate engine: splits that may hold multiple
