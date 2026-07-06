@@ -20,7 +20,6 @@ use super::data_file_reader::DataFileReader;
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::filtering::reader_pruning_predicates;
 use crate::spec::{CoreOptions, DataField, MergeEngine, Predicate};
 use crate::DataSplit;
 
@@ -63,10 +62,18 @@ impl<'a> TableRead<'a> {
         self.table
     }
 
-    /// Set a filter predicate for conservative read-side pruning.
+    /// Set a filter predicate. Used conservatively for read-side pruning and
+    /// enforced exactly by the residual filter on append and data-evolution
+    /// read paths (see [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
+    /// for per-format exceptions).
+    /// Primary-key merge reads currently apply only primary-key conjuncts.
     pub fn with_filter(mut self, filter: Predicate) -> Self {
         let (_, data_predicates) = split_scan_predicates(self.table, filter);
-        self.data_predicates = reader_pruning_predicates(data_predicates);
+        // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
+        // pushdown / stats pruning skip compound nodes they cannot use, and the
+        // residual pass applies the full predicate exactly. Pruning here would
+        // drop compound predicates before the residual could enforce them.
+        self.data_predicates = data_predicates;
         self
     }
 
@@ -190,6 +197,7 @@ impl<'a> TableRead<'a> {
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
+            self.data_predicates.clone(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
         )?;
