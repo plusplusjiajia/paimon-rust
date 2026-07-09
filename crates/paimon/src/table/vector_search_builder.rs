@@ -35,7 +35,9 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray
 use futures::TryStreamExt;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
-use std::collections::{HashMap, HashSet};
+use roaring::RoaringTreemap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Cursor;
 
 const INDEX_DIR: &str = "index";
@@ -350,6 +352,22 @@ async fn evaluate_batch_vector_search(
         None
     };
 
+    let max_limit = vector_searches
+        .iter()
+        .map(|vector_search| vector_search.limit)
+        .max()
+        .unwrap_or(0);
+    let refine_factor = match vector_entries.first() {
+        Some(entry) => configured_refine_factor(
+            &search_options,
+            evaluation.table_options,
+            field_name,
+            &entry.index_file.index_type,
+        )?,
+        None => 0,
+    };
+    let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
+
     let mut merged = vec![SearchResult::empty(); vector_searches.len()];
     if !vector_entries.is_empty() {
         let futures: Vec<_> = vector_entries
@@ -364,17 +382,13 @@ async fn evaluate_batch_vector_search(
                 let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
                 let row_range_start = global_meta.row_range_start;
                 let row_range_end = global_meta.row_range_end;
-                let max_limit = vector_searches
-                    .iter()
-                    .map(|vector_search| vector_search.limit)
-                    .max()
-                    .unwrap_or(0);
                 let index_limit = search_limit_with_deleted_rows(
-                    max_limit,
+                    index_search_limit,
                     row_range_start,
                     row_range_end,
                     deleted_row_index.as_ref(),
-                );
+                )
+                .min(i32::MAX as usize);
                 let mut vector_searches = vector_searches.to_vec();
                 for vector_search in &mut vector_searches {
                     vector_search.limit = index_limit;
@@ -444,6 +458,19 @@ async fn evaluate_batch_vector_search(
         }
     }
 
+    if refine_factor != 0 {
+        merged = maybe_rerank_indexed_batch_results(
+            evaluation,
+            index_entries,
+            field_id,
+            field_name,
+            vector_searches,
+            merged,
+            index_search_limit,
+        )
+        .await?;
+    }
+
     if search_mode != GlobalIndexSearchMode::Fast {
         let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
@@ -498,6 +525,110 @@ async fn evaluate_batch_vector_search(
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+}
+
+fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
+    if refine_factor == 0 {
+        return Ok(limit);
+    }
+    let search_limit =
+        limit
+            .checked_mul(refine_factor)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
+                ),
+            })?;
+    if search_limit > i32::MAX as usize {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
+            ),
+        });
+    }
+    Ok(search_limit)
+}
+
+async fn maybe_rerank_indexed_batch_results(
+    evaluation: VectorSearchEvaluation<'_>,
+    index_entries: &[IndexManifestEntry],
+    field_id: i32,
+    field_name: &str,
+    vector_searches: &[VectorSearch],
+    results: Vec<SearchResult>,
+    index_search_limit: usize,
+) -> crate::Result<Vec<SearchResult>> {
+    let mut candidate_searches = Vec::with_capacity(vector_searches.len());
+    let mut candidate_results = Vec::with_capacity(vector_searches.len());
+    let mut union_candidates = RoaringTreemap::new();
+
+    for (result, vector_search) in results.into_iter().zip(vector_searches) {
+        let candidates = result.top_k(index_search_limit);
+        let mut include_row_ids = RoaringTreemap::new();
+        for &row_id in &candidates.row_ids {
+            include_row_ids.insert(row_id);
+            union_candidates.insert(row_id);
+        }
+
+        let mut candidate_search = vector_search.clone();
+        candidate_search.include_row_ids = Some(include_row_ids);
+        candidate_searches.push(candidate_search);
+        candidate_results.push(candidates);
+    }
+
+    if union_candidates.iter().next().is_none() {
+        return Ok(candidate_results);
+    }
+
+    let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
+        message: "Vector index rerank requires table context".to_string(),
+        source: None,
+    })?;
+    let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
+    let metric = resolve_raw_vector_metric(
+        evaluation.file_io,
+        evaluation.table_path.trim_end_matches('/'),
+        evaluation.table_options,
+        index_entries,
+        field_id,
+        field_name,
+    )
+    .await?;
+
+    read_raw_batch_vector_search(table, &candidate_searches, &raw_ranges, metric).await
+}
+
+fn sorted_row_ids_to_row_ranges(
+    row_ids: impl IntoIterator<Item = u64>,
+) -> crate::Result<Vec<RowRange>> {
+    let mut row_ids = row_ids.into_iter();
+    let Some(first) = row_ids.next() else {
+        return Ok(Vec::new());
+    };
+    let mut start = row_id_to_i64_for_range(first)?;
+    let mut end = start;
+    let mut ranges = Vec::new();
+    for row_id in row_ids {
+        let row_id = row_id_to_i64_for_range(row_id)?;
+        if end.checked_add(1) == Some(row_id) {
+            end = row_id;
+        } else {
+            ranges.push(RowRange::new(start, end));
+            start = row_id;
+            end = row_id;
+        }
+    }
+    ranges.push(RowRange::new(start, end));
+    Ok(ranges)
+}
+
+fn row_id_to_i64_for_range(row_id: u64) -> crate::Result<i64> {
+    i64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+        message: format!(
+            "Vector search row id {row_id} exceeds i64::MAX and cannot be converted to RowRange"
+        ),
+        source: None,
+    })
 }
 
 async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
@@ -561,6 +692,80 @@ impl RawVectorMetric {
 
 fn normalize_metric(metric: &str) -> String {
     metric.to_ascii_lowercase().replace('-', "_")
+}
+
+fn indexed_type_prefixes(field_name: &str, index_type: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    add_refine_prefixes(&mut prefixes, &format!("fields.{field_name}."), index_type);
+    add_refine_prefixes(&mut prefixes, "", index_type);
+    prefixes
+}
+
+fn add_refine_prefixes(prefixes: &mut Vec<String>, base: &str, index_type: &str) {
+    if !index_type.is_empty() {
+        prefixes.push(format!("{base}{index_type}."));
+        let normalized = normalize_metric(index_type);
+        if normalized != index_type {
+            prefixes.push(format!("{base}{normalized}."));
+        }
+        if normalized.starts_with("ivf") {
+            prefixes.push(format!("{base}ivf."));
+        }
+    }
+    prefixes.push(base.to_string());
+}
+
+fn configured_refine_factor(
+    search_options: &HashMap<String, String>,
+    table_options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: &str,
+) -> crate::Result<usize> {
+    if let Some(value) =
+        configured_refine_factor_from_options(search_options, field_name, index_type)
+    {
+        return parse_refine_factor(&value);
+    }
+    if let Some(value) =
+        configured_refine_factor_from_options(table_options, field_name, index_type)
+    {
+        return parse_refine_factor(&value);
+    }
+    Ok(0)
+}
+
+fn configured_refine_factor_from_options(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: &str,
+) -> Option<String> {
+    for prefix in indexed_type_prefixes(field_name, index_type) {
+        for suffix in [
+            "refine_factor",
+            "refine-factor",
+            "rerank_factor",
+            "rerank-factor",
+        ] {
+            if let Some(value) = options.get(&(prefix.clone() + suffix)) {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_refine_factor(value: &str) -> crate::Result<usize> {
+    let factor = value
+        .parse::<usize>()
+        .map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("Invalid vector refine factor: {value}. Must be an integer."),
+        })?;
+    if factor == 0 {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("Vector refine factor must be positive, got: {value}"),
+        });
+    }
+    Ok(factor)
 }
 
 async fn resolve_raw_vector_metric(
@@ -695,33 +900,155 @@ async fn read_raw_batch_vector_search(
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
 
-    let mut row_ids = vec![Vec::new(); vector_searches.len()];
-    let mut scores = vec![Vec::new(); vector_searches.len()];
+    let scoring_plan = RawScoringPlan::new(vector_searches, metric);
+    let mut top_k = vector_searches
+        .iter()
+        .map(|vector_search| RawScoreTopK::new(vector_search.limit))
+        .collect::<Vec<_>>();
     while let Some(batch) = stream.try_next().await? {
-        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &mut row_ids, &mut scores)?;
+        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &scoring_plan, &mut top_k)?;
     }
 
-    Ok(row_ids
+    Ok(top_k
         .into_iter()
-        .zip(scores)
-        .zip(vector_searches)
-        .map(|((row_ids, scores), vector_search)| {
-            SearchResult::new(row_ids, scores).top_k(vector_search.limit)
-        })
+        .map(RawScoreTopK::into_search_result)
         .collect())
+}
+
+struct RawScoringPlan {
+    all_query_indices: Vec<usize>,
+    candidate_query_indices: HashMap<u64, Vec<usize>>,
+    query_l2_norms: Vec<f32>,
+}
+
+impl RawScoringPlan {
+    fn new(vector_searches: &[VectorSearch], metric: RawVectorMetric) -> Self {
+        let mut all_query_indices = Vec::new();
+        let mut candidate_query_indices: HashMap<u64, Vec<usize>> = HashMap::new();
+        let query_l2_norms = vector_searches
+            .iter()
+            .map(|vector_search| match metric {
+                RawVectorMetric::Cosine => vector_search
+                    .vector
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt(),
+                RawVectorMetric::L2 | RawVectorMetric::InnerProduct => 0.0,
+            })
+            .collect();
+
+        for (query_index, vector_search) in vector_searches.iter().enumerate() {
+            if let Some(include_row_ids) = &vector_search.include_row_ids {
+                for row_id in include_row_ids.iter() {
+                    candidate_query_indices
+                        .entry(row_id)
+                        .or_default()
+                        .push(query_index);
+                }
+            } else {
+                all_query_indices.push(query_index);
+            }
+        }
+
+        Self {
+            all_query_indices,
+            candidate_query_indices,
+            query_l2_norms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RawScoredRow {
+    row_id: u64,
+    score: f32,
+}
+
+impl Eq for RawScoredRow {}
+
+impl PartialOrd for RawScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawScoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl RawScoredRow {
+    fn is_stronger_than(&self, other: &Self) -> bool {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.row_id.cmp(&self.row_id))
+            == Ordering::Greater
+    }
+}
+
+struct RawScoreTopK {
+    limit: usize,
+    heap: BinaryHeap<RawScoredRow>,
+}
+
+impl RawScoreTopK {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.min(1024).saturating_add(1)),
+        }
+    }
+
+    fn offer(&mut self, row_id: u64, score: f32) {
+        if self.limit == 0 {
+            return;
+        }
+        let entry = RawScoredRow { row_id, score };
+        if self.heap.len() < self.limit {
+            self.heap.push(entry);
+        } else if self
+            .heap
+            .peek()
+            .is_some_and(|weakest| entry.is_stronger_than(weakest))
+        {
+            self.heap.pop();
+            self.heap.push(entry);
+        }
+    }
+
+    fn into_search_result(self) -> SearchResult {
+        let mut rows = self.heap.into_vec();
+        rows.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        let mut row_ids = Vec::with_capacity(rows.len());
+        let mut scores = Vec::with_capacity(rows.len());
+        for row in rows {
+            row_ids.push(row.row_id);
+            scores.push(row.score);
+        }
+        SearchResult::new(row_ids, scores)
+    }
 }
 
 fn collect_raw_batch_vector_batch(
     batch: &RecordBatch,
     vector_searches: &[VectorSearch],
     metric: RawVectorMetric,
-    row_ids_out: &mut [Vec<u64>],
-    scores_out: &mut [Vec<f32>],
+    scoring_plan: &RawScoringPlan,
+    top_k_out: &mut [RawScoreTopK],
 ) -> crate::Result<()> {
     if vector_searches.is_empty() {
         return Ok(());
     }
-    if row_ids_out.len() != vector_searches.len() || scores_out.len() != vector_searches.len() {
+    if top_k_out.len() != vector_searches.len() {
         return Err(crate::Error::DataInvalid {
             message: "Raw batch vector search output buffers must match query vector count"
                 .to_string(),
@@ -823,46 +1150,139 @@ fn collect_raw_batch_vector_batch(
                 (row * len, (row + 1) * len)
             }
         };
+        ensure_raw_vector_values_not_null(values, start, end)?;
 
-        let mut stored = Vec::with_capacity(end - start);
-        for value_index in start..end {
-            if values.is_null(value_index) {
-                return Err(crate::Error::DataInvalid {
-                    message: "Vector raw search found null vector element".to_string(),
-                    source: None,
-                });
-            }
-            stored.push(values.value(value_index));
-        }
-
-        for (query_index, vector_search) in vector_searches.iter().enumerate() {
-            if vector_search
-                .include_row_ids
-                .as_ref()
-                .is_some_and(|include_row_ids| !include_row_ids.contains(row_id))
-            {
-                continue;
-            }
-            if stored.len() != vector_search.vector.len() {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Query vector dimension mismatch: raw row has {}, but query has {}",
-                        stored.len(),
-                        vector_search.vector.len()
-                    ),
-                    source: None,
-                });
-            }
-            row_ids_out[query_index].push(row_id);
-            scores_out[query_index].push(compute_raw_vector_score(
-                &vector_search.vector,
-                &stored,
+        let raw_row = RawVectorRow {
+            row_id,
+            values,
+            start,
+            end,
+        };
+        for &query_index in &scoring_plan.all_query_indices {
+            offer_raw_vector_score(
+                raw_row,
+                query_index,
                 metric,
-            ));
+                vector_searches,
+                scoring_plan,
+                top_k_out,
+            )?;
+        }
+        if let Some(query_indices) = scoring_plan.candidate_query_indices.get(&row_id) {
+            for &query_index in query_indices {
+                offer_raw_vector_score(
+                    raw_row,
+                    query_index,
+                    metric,
+                    vector_searches,
+                    scoring_plan,
+                    top_k_out,
+                )?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn ensure_raw_vector_values_not_null(
+    values: &Float32Array,
+    start: usize,
+    end: usize,
+) -> crate::Result<()> {
+    for value_index in start..end {
+        if values.is_null(value_index) {
+            return Err(crate::Error::DataInvalid {
+                message: "Vector raw search found null vector element".to_string(),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RawVectorRow<'a> {
+    row_id: u64,
+    values: &'a Float32Array,
+    start: usize,
+    end: usize,
+}
+
+fn offer_raw_vector_score(
+    row: RawVectorRow<'_>,
+    query_index: usize,
+    metric: RawVectorMetric,
+    vector_searches: &[VectorSearch],
+    scoring_plan: &RawScoringPlan,
+    top_k_out: &mut [RawScoreTopK],
+) -> crate::Result<()> {
+    let vector_search = &vector_searches[query_index];
+    let stored_len = row.end - row.start;
+    if stored_len != vector_search.vector.len() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Query vector dimension mismatch: raw row has {}, but query has {}",
+                stored_len,
+                vector_search.vector.len()
+            ),
+            source: None,
+        });
+    }
+    let score = compute_raw_vector_score_from_values(
+        &vector_search.vector,
+        scoring_plan.query_l2_norms[query_index],
+        row.values,
+        row.start,
+        row.end,
+        metric,
+    );
+    top_k_out[query_index].offer(row.row_id, score);
+    Ok(())
+}
+
+fn compute_raw_vector_score_from_values(
+    query: &[f32],
+    query_l2_norm: f32,
+    values: &Float32Array,
+    start: usize,
+    end: usize,
+    metric: RawVectorMetric,
+) -> f32 {
+    debug_assert_eq!(query.len(), end - start);
+    match metric {
+        RawVectorMetric::L2 => {
+            let sum_sq = query
+                .iter()
+                .zip(start..end)
+                .map(|(q, value_index)| {
+                    let diff = q - values.value(value_index);
+                    diff * diff
+                })
+                .sum::<f32>();
+            1.0 / (1.0 + sum_sq)
+        }
+        RawVectorMetric::Cosine => {
+            let mut dot = 0.0;
+            let mut norm_b = 0.0;
+            for (q, value_index) in query.iter().zip(start..end) {
+                let stored = values.value(value_index);
+                dot += q * stored;
+                norm_b += stored * stored;
+            }
+            let denominator = query_l2_norm * norm_b.sqrt();
+            if denominator == 0.0 {
+                0.0
+            } else {
+                dot / denominator
+            }
+        }
+        RawVectorMetric::InnerProduct => query
+            .iter()
+            .zip(start..end)
+            .map(|(q, value_index)| q * values.value(value_index))
+            .sum(),
+    }
 }
 
 fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
@@ -872,6 +1292,7 @@ fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
     })
 }
 
+#[cfg(test)]
 fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetric) -> f32 {
     match metric {
         RawVectorMetric::L2 => {
@@ -1005,6 +1426,76 @@ mod tests {
     }
 
     #[test]
+    fn test_configured_refine_factor_precedence_and_aliases() {
+        let table_options = HashMap::from([(
+            "fields.embedding.ivf.refine-factor".to_string(),
+            "3".to_string(),
+        )]);
+        let search_options = HashMap::from([(
+            "fields.embedding.ivf_flat.rerank_factor".to_string(),
+            "2".to_string(),
+        )]);
+        assert_eq!(
+            configured_refine_factor(
+                &search_options,
+                &table_options,
+                "embedding",
+                IVF_FLAT_IDENTIFIER,
+            )
+            .unwrap(),
+            2
+        );
+
+        assert_eq!(
+            configured_refine_factor(
+                &HashMap::new(),
+                &table_options,
+                "embedding",
+                IVF_FLAT_IDENTIFIER,
+            )
+            .unwrap(),
+            3
+        );
+
+        let global_options = HashMap::from([("rerank-factor".to_string(), "4".to_string())]);
+        assert_eq!(
+            configured_refine_factor(
+                &HashMap::new(),
+                &global_options,
+                "embedding",
+                LUMINA_IDENTIFIER,
+            )
+            .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_configured_refine_factor_rejects_invalid_values() {
+        let zero_options = HashMap::from([("refine_factor".to_string(), "0".to_string())]);
+        let err = configured_refine_factor(
+            &zero_options,
+            &HashMap::new(),
+            "embedding",
+            LUMINA_IDENTIFIER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+
+        let invalid_options = HashMap::from([("refine_factor".to_string(), "abc".to_string())]);
+        let err = configured_refine_factor(
+            &invalid_options,
+            &HashMap::new(),
+            "embedding",
+            LUMINA_IDENTIFIER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Must be an integer"));
+
+        assert!(indexed_search_limit(i32::MAX as usize, 2).is_err());
+    }
+
+    #[test]
     fn test_collect_raw_batch_vector_batch_preserves_query_order() {
         let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
         let mut builder =
@@ -1037,25 +1528,86 @@ mod tests {
             VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap(),
             VectorSearch::new(vec![0.0, 1.0], 1, "embedding".to_string()).unwrap(),
         ];
-        let mut row_ids = vec![Vec::new(); searches.len()];
-        let mut scores = vec![Vec::new(); searches.len()];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
         collect_raw_batch_vector_batch(
             &batch,
             &searches,
             RawVectorMetric::L2,
-            &mut row_ids,
-            &mut scores,
+            &scoring_plan,
+            &mut top_k,
         )
         .unwrap();
-        let results = row_ids
+        let results = top_k
             .into_iter()
-            .zip(scores)
-            .map(|(row_ids, scores)| SearchResult::new(row_ids, scores).top_k(1))
+            .map(RawScoreTopK::into_search_result)
             .collect::<Vec<_>>();
 
         assert_eq!(results[0].row_ids, vec![10]);
         assert_eq!(results[1].row_ids, vec![11]);
+    }
+
+    #[test]
+    fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
+        for vector in [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]] {
+            builder.values().append_value(vector[0]);
+            builder.values().append_value(vector[1]);
+            builder.append(true);
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(builder.finish()) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut include_row_ids = RoaringTreemap::new();
+        include_row_ids.insert(12);
+        let searches = vec![
+            VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
+                .unwrap()
+                .with_include_row_ids(include_row_ids),
+        ];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
+
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap();
+        let results = top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .collect::<Vec<_>>();
+
+        assert_eq!(results[0].row_ids, vec![12]);
+        assert_eq!(results[0].scores.len(), 1);
     }
 
     #[tokio::test]
