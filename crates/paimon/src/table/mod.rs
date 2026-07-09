@@ -23,7 +23,6 @@ mod bitmap_global_index_reader;
 mod blob_resolver;
 mod branch_manager;
 mod btree_global_index_build_builder;
-mod btree_global_index_drop_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -41,6 +40,7 @@ mod dedicated_format_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
+mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
 mod global_index_types;
 mod hybrid_search_builder;
@@ -77,13 +77,16 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
-pub use btree_global_index_drop_builder::BTreeGlobalIndexDropBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
+pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_types::{
+    normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+};
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };
@@ -220,8 +223,8 @@ impl Table {
         BTreeGlobalIndexBuildBuilder::new(self)
     }
 
-    pub fn new_btree_global_index_drop_builder(&self) -> BTreeGlobalIndexDropBuilder<'_> {
-        BTreeGlobalIndexDropBuilder::new(self)
+    pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
+        GlobalIndexDropBuilder::new(self)
     }
 
     pub fn new_vindex_index_build_builder(&self, index_type: &str) -> VindexIndexBuildBuilder<'_> {
