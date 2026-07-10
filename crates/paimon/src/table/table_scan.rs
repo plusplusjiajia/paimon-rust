@@ -48,7 +48,6 @@ use crate::table::source::{
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 use crate::table::ScanTrace;
-use crate::table::SnapshotManager;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -868,20 +867,16 @@ impl<'a> PaimonTableScan<'a> {
             });
         }
 
-        let file_io = self.table.file_io();
-        let table_path = self.table.location();
-
         match super::time_travel::travel_to_snapshot(
-            file_io,
-            table_path,
+            &self.table.snapshot_manager(),
+            &self.table.tag_manager(),
             self.table.schema().options(),
         )
         .await?
         {
             Some(snapshot) => Ok(Some(snapshot)),
             None => {
-                let snapshot_manager =
-                    SnapshotManager::new(file_io.clone(), table_path.to_string());
+                let snapshot_manager = self.table.snapshot_manager();
                 snapshot_manager.get_latest_snapshot().await
             }
         }

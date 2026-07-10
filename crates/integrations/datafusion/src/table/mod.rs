@@ -402,6 +402,12 @@ impl TableProvider for PaimonTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if self.table.is_branch_reference() {
+            return Err(datafusion::error::DataFusionError::NotImplemented(format!(
+                "Writing to Paimon branch '{}' is not supported",
+                self.table.branch()
+            )));
+        }
         let overwrite = match insert_op {
             InsertOp::Append => false,
             InsertOp::Overwrite => true,

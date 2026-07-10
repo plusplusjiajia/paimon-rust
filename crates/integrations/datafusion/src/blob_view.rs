@@ -36,6 +36,7 @@ use paimon::spec::BlobViewStruct;
 use crate::error::to_datafusion_error;
 use crate::runtime::block_on_with_runtime;
 use crate::table_function_args::parse_table_identifier;
+use crate::table_loader::load_data_table_for_read;
 
 const FUNCTION_NAME: &str = "blob_view";
 
@@ -68,10 +69,9 @@ impl BlobViewFunc {
         let identifier = parse_table_identifier(FUNCTION_NAME, table_name, &self.default_database)?;
         let catalog = Arc::clone(&self.catalog);
         let table = block_on_with_runtime(
-            async move { catalog.get_table(&identifier).await },
+            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
             "blob_view: catalog access thread panicked",
-        )
-        .map_err(to_datafusion_error)?;
+        )?;
 
         let field = table
             .schema()

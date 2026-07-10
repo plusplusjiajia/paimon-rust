@@ -50,6 +50,8 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         let index_type =
             normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
                 Error::Unsupported {

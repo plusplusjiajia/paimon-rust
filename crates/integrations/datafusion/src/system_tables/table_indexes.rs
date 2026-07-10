@@ -34,7 +34,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
     BinaryRow, DataField, DeletionVectorMeta, FileKind, IndexManifest, IndexManifestEntry,
 };
-use paimon::table::{SnapshotManager, Table};
+use paimon::table::Table;
 
 use super::row_string_cast::format_row_as_java_cast_string;
 use crate::error::to_datafusion_error;
@@ -187,16 +187,21 @@ impl TableProvider for TableIndexesTable {
 
 async fn collect_index_entries(table: &Table) -> paimon::Result<Vec<IndexManifestEntry>> {
     let file_io = table.file_io();
-    let sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
-    let snapshot = match sm.get_latest_snapshot().await? {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let snapshot_sm = table.snapshot_manager();
+    let manifest_sm =
+        paimon::table::SnapshotManager::new(file_io.clone(), table.location().to_string());
+    let snapshot = match table.travel_snapshot().cloned() {
+        Some(snapshot) => snapshot,
+        None => match snapshot_sm.get_latest_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        },
     };
     let Some(index_manifest_name) = snapshot.index_manifest() else {
         return Ok(Vec::new());
     };
 
-    let path = sm.manifest_path(index_manifest_name);
+    let path = manifest_sm.manifest_path(index_manifest_name);
     if !file_io.exists(&path).await? {
         return Ok(Vec::new());
     }

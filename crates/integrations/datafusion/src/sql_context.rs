@@ -57,7 +57,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use futures::StreamExt;
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::{parse_object_name, Catalog, Identifier};
 use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BinaryType, BlobType, BooleanType, CharType,
     DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum, DecimalType,
@@ -67,6 +67,7 @@ use paimon::spec::{
 };
 
 use crate::error::to_datafusion_error;
+use crate::table_loader::load_table_for_read;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
@@ -510,10 +511,8 @@ impl SQLContext {
             let (catalog, _catalog_name, identifier) =
                 self.resolve_table_name_from_ref(&table_ref)?;
 
-            let paimon_table = catalog
-                .get_table(&identifier)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let (paimon_table, base_identifier, system_name) =
+                load_table_for_read(&catalog, &identifier).await?;
 
             // Merge dynamic options with time-travel options
             let mut options = self.dynamic_options.read().unwrap().clone();
@@ -523,10 +522,22 @@ impl SQLContext {
                 .copy_with_time_travel(options)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
-                table_with_options,
-                self.blob_reader_registry.clone(),
-            )?);
+            let provider: Arc<dyn TableProvider> = if let Some(system_name) = system_name {
+                crate::system_tables::provider_for_table(
+                    Arc::clone(&catalog),
+                    base_identifier,
+                    table_with_options,
+                    &system_name,
+                )?
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown Paimon system table: {system_name}"))
+                })?
+            } else {
+                Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                    table_with_options,
+                    self.blob_reader_registry.clone(),
+                )?)
+            };
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -540,10 +551,8 @@ impl SQLContext {
             let (catalog, _catalog_name, identifier) =
                 self.resolve_table_name_from_ref(&table_ref)?;
 
-            let paimon_table = catalog
-                .get_table(&identifier)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let (paimon_table, base_identifier, system_name) =
+                load_table_for_read(&catalog, &identifier).await?;
 
             let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
 
@@ -555,10 +564,22 @@ impl SQLContext {
                 .copy_with_time_travel(options)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
-                table_with_options,
-                self.blob_reader_registry.clone(),
-            )?);
+            let provider: Arc<dyn TableProvider> = if let Some(system_name) = system_name {
+                crate::system_tables::provider_for_table(
+                    Arc::clone(&catalog),
+                    base_identifier,
+                    table_with_options,
+                    &system_name,
+                )?
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown Paimon system table: {system_name}"))
+                })?
+            } else {
+                Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                    table_with_options,
+                    self.blob_reader_registry.clone(),
+                )?)
+            };
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -901,6 +922,7 @@ impl SQLContext {
         operations: &[AlterTableOperation],
         if_exists: bool,
     ) -> DFResult<DataFrame> {
+        Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         let identifier = self.resolve_table_name(name)?;
 
         let mut changes = Vec::new();
@@ -1030,6 +1052,7 @@ impl SQLContext {
                 )))
             }
         };
+        Self::ensure_main_branch_write_target(&table_name, "MERGE INTO")?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -1050,6 +1073,7 @@ impl SQLContext {
                 )))
             }
         };
+        Self::ensure_main_branch_write_target(&table_name, "UPDATE")?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -1077,6 +1101,7 @@ impl SQLContext {
                 )))
             }
         };
+        Self::ensure_main_branch_write_target(&table_name, "DELETE")?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -1098,6 +1123,7 @@ impl SQLContext {
                 )))
             }
         };
+        Self::ensure_main_branch_write_target(&table_name, "INSERT OVERWRITE")?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
         let table = catalog
             .get_table(&identifier)
@@ -1217,7 +1243,7 @@ impl SQLContext {
         }
 
         let messages = tw.prepare_commit().await.map_err(to_datafusion_error)?;
-        let commit = wb.new_commit();
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
 
         let overwrite_partitions = if static_partitions.is_empty() {
             None
@@ -1242,6 +1268,7 @@ impl SQLContext {
         let target = truncate.table_names.first().ok_or_else(|| {
             DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
         })?;
+        Self::ensure_main_branch_write_target(&target.name, "TRUNCATE TABLE")?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&target.name)?;
         let table = match catalog.get_table(&identifier).await {
             Ok(t) => t,
@@ -1252,7 +1279,7 @@ impl SQLContext {
         };
 
         let wb = table.new_write_builder();
-        let commit = wb.new_commit();
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
 
         if let Some(partitions) = &truncate.partitions {
             if partitions.is_empty() {
@@ -1337,7 +1364,7 @@ impl SQLContext {
         )?;
 
         let wb = table.new_write_builder();
-        let commit = wb.new_commit();
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
         commit
             .truncate_partitions(partition_values)
             .await
@@ -1424,6 +1451,22 @@ impl SQLContext {
                 "Invalid table reference: {name}"
             ))),
         }
+    }
+
+    fn ensure_main_branch_write_target(name: &ObjectName, operation: &str) -> DFResult<()> {
+        let object = name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.as_str())
+            .ok_or_else(|| DataFusionError::Plan(format!("Invalid table reference: {name}")))?;
+        let parsed = parse_object_name(object).map_err(to_datafusion_error)?;
+        if let Some(branch) = parsed.branch() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on Paimon branch '{branch}' is not supported"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve an ObjectName to just the Identifier (for backward compat in handle_alter_table).

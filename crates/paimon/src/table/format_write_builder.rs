@@ -56,6 +56,11 @@ impl<'a> FormatWriteBuilder<'a> {
         TableCommit::new(self.table.clone(), self.commit_user.clone())
     }
 
+    pub(crate) fn try_new_commit(&self) -> crate::Result<TableCommit> {
+        self.table.ensure_not_branch_reference_for_write()?;
+        Ok(self.new_commit())
+    }
+
     pub(crate) fn new_write(&self) -> crate::Result<TableWrite> {
         Err(crate::Error::Unsupported {
             message: "Writing format tables is not supported by the Rust client yet".to_string(),

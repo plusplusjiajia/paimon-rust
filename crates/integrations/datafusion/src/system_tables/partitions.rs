@@ -31,7 +31,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::spec::{CoreOptions, Partition};
 use paimon::table::Table;
 
@@ -50,6 +50,7 @@ pub(super) fn build(
     Ok(Arc::new(PartitionsTable {
         catalog,
         identifier,
+        table,
         partition_keys,
         default_partition_name,
     }))
@@ -87,6 +88,7 @@ fn partitions_schema() -> SchemaRef {
 struct PartitionsTable {
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,
+    table: Table,
     partition_keys: Vec<String>,
     default_partition_name: String,
 }
@@ -116,12 +118,30 @@ impl TableProvider for PartitionsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let catalog = self.catalog.clone();
-        let identifier = self.identifier.clone();
-        let partitions = crate::runtime::await_with_runtime(async move {
-            catalog.list_partitions(&identifier).await
-        })
-        .await
+        let table = self.table.clone();
+        let partitions = if table.travel_snapshot().is_some() {
+            crate::runtime::await_with_runtime(async move {
+                list_partitions_from_file_system(&table).await
+            })
+            .await
+        } else {
+            let catalog = self.catalog.clone();
+            let identifier = if table.is_main_branch() {
+                self.identifier.clone()
+            } else {
+                Identifier::new(
+                    self.identifier.database(),
+                    format!("{}$branch_{}", self.identifier.object(), table.branch()),
+                )
+            };
+            crate::runtime::await_with_runtime(async move {
+                match catalog.list_partitions(&identifier).await {
+                    Ok(partitions) => Ok(partitions),
+                    Err(_) => list_partitions_from_file_system(&table).await,
+                }
+            })
+            .await
+        }
         .map_err(to_datafusion_error)?;
 
         let mut rows: Vec<(String, Partition)> = partitions

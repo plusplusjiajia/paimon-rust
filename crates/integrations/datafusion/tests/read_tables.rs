@@ -1399,6 +1399,8 @@ mod fulltext_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{Int32Array, StringArray};
+    use paimon::catalog::Identifier;
+    use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_full_text_search, SQLContext};
 
@@ -1420,19 +1422,18 @@ mod fulltext_tests {
         (tmp, warehouse)
     }
 
-    async fn create_fulltext_context() -> (SQLContext, tempfile::TempDir) {
+    async fn create_fulltext_context() -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         let (tmp, warehouse) = extract_test_warehouse();
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
-        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+        let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
 
         let mut ctx = SQLContext::new();
         ctx.register_catalog("paimon", catalog.clone())
             .await
             .expect("Failed to register catalog");
-        register_full_text_search(ctx.ctx(), catalog, "default");
-        (ctx, tmp)
+        register_full_text_search(ctx.ctx(), catalog.clone(), "default");
+        (ctx, catalog, tmp)
     }
 
     fn extract_id_content_rows(
@@ -1459,7 +1460,7 @@ mod fulltext_tests {
     /// Search for 'paimon' — rows 0, 2, 4 mention "paimon".
     #[tokio::test]
     async fn test_full_text_search_paimon() {
-        let (ctx, _tmp) = create_fulltext_context().await;
+        let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
             .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'paimon', 10)")
             .await
@@ -1477,10 +1478,49 @@ mod fulltext_tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_full_text_search_branch() {
+        let (ctx, catalog, _tmp) = create_fulltext_context().await;
+        let identifier = Identifier::new("default", "test_tantivy_fulltext");
+        let table = catalog.get_table(&identifier).await.expect("load table");
+        let snapshot_manager = table.snapshot_manager();
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .expect("load latest snapshot")
+            .expect("latest snapshot");
+        table
+            .tag_manager()
+            .create("branch-source", &snapshot)
+            .await
+            .expect("create tag");
+        BranchManager::new(table.file_io().clone(), table.location().to_string())
+            .create_branch_from_tag("b1", "branch-source")
+            .await
+            .expect("create branch");
+        table
+            .file_io()
+            .delete_dir(&snapshot_manager.snapshot_dir())
+            .await
+            .expect("delete main snapshots");
+
+        let batches = ctx
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext$branch_b1', 'content', 'paimon', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("branch query should execute");
+
+        let rows = extract_id_content_rows(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 2, 4]);
+    }
+
     /// Search for 'tantivy' — only row 1.
     #[tokio::test]
     async fn test_full_text_search_tantivy() {
-        let (ctx, _tmp) = create_fulltext_context().await;
+        let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
             .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'tantivy', 10)")
             .await
@@ -1497,7 +1537,7 @@ mod fulltext_tests {
     /// Search for 'search' — rows 1, 3 mention "full-text search".
     #[tokio::test]
     async fn test_full_text_search_search() {
-        let (ctx, _tmp) = create_fulltext_context().await;
+        let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
             .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'search', 10)")
             .await
@@ -1526,6 +1566,7 @@ mod vector_search_tests {
     use datafusion::datasource::MemTable;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema};
+    use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_vector_search, SQLContext};
 
@@ -1547,26 +1588,29 @@ mod vector_search_tests {
         (tmp, warehouse)
     }
 
-    async fn create_vector_search_context(archive_name: &str) -> (SQLContext, tempfile::TempDir) {
+    async fn create_vector_search_context(
+        archive_name: &str,
+    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         let (tmp, warehouse) = extract_test_warehouse(archive_name);
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
-        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+        let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
 
         let mut ctx = SQLContext::new();
         ctx.register_catalog("paimon", catalog.clone())
             .await
             .expect("Failed to register catalog");
-        register_vector_search(ctx.ctx(), catalog, "default");
-        (ctx, tmp)
+        register_vector_search(ctx.ctx(), catalog.clone(), "default");
+        (ctx, catalog, tmp)
     }
 
-    async fn create_lumina_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+    async fn create_lumina_vector_search_context(
+    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         create_vector_search_context("test_lumina_vector.tar.gz").await
     }
 
-    async fn create_java_vindex_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+    async fn create_java_vindex_vector_search_context(
+    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         create_vector_search_context("test_java_vindex_vector.tar.gz").await
     }
 
@@ -1748,7 +1792,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top3() {
-        let (ctx, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
             .await
@@ -1763,8 +1807,47 @@ mod vector_search_tests {
     }
 
     #[tokio::test]
+    async fn test_vector_search_branch() {
+        let (ctx, catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        let identifier = Identifier::new("default", "test_java_vindex_vector");
+        let table = catalog.get_table(&identifier).await.expect("load table");
+        let snapshot_manager = table.snapshot_manager();
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .expect("load latest snapshot")
+            .expect("latest snapshot");
+        table
+            .tag_manager()
+            .create("branch-source", &snapshot)
+            .await
+            .expect("create tag");
+        BranchManager::new(table.file_io().clone(), table.location().to_string())
+            .create_branch_from_tag("b1", "branch-source")
+            .await
+            .expect("create branch");
+        table
+            .file_io()
+            .delete_dir(&snapshot_manager.snapshot_dir())
+            .await
+            .expect("delete main snapshots");
+
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector$branch_b1', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("branch query should execute");
+
+        let ids = extract_ids(&batches);
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&0));
+    }
+
+    #[tokio::test]
     async fn test_vector_search_top6_returns_all() {
-        let (ctx, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
             .await
@@ -1779,7 +1862,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_without_matching_index_returns_empty() {
-        let (ctx, _tmp) = create_lumina_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
             .await
@@ -1797,7 +1880,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_java_vindex_table() {
-        let (ctx, _tmp) = create_java_vindex_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
             .await
@@ -1812,7 +1895,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_lateral_join_uses_query_vectors() {
-        let (ctx, _tmp) = create_java_vindex_vector_search_context().await;
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         let query_batch = build_vector_batch(
             vec![10, 20],
             vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
@@ -2018,6 +2101,8 @@ mod hybrid_search_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::Int32Array;
+    use paimon::catalog::Identifier;
+    use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::SQLContext;
 
@@ -2039,18 +2124,18 @@ mod hybrid_search_tests {
         (tmp, warehouse)
     }
 
-    async fn create_hybrid_search_context() -> (SQLContext, tempfile::TempDir) {
+    async fn create_hybrid_search_context(
+    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
         let (tmp, warehouse) = extract_test_warehouse("test_java_vindex_vector.tar.gz");
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
-        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+        let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
 
         let mut ctx = SQLContext::new();
         ctx.register_catalog("paimon", catalog.clone())
             .await
             .expect("Failed to register catalog");
-        (ctx, tmp)
+        (ctx, catalog, tmp)
     }
 
     fn extract_ids(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
@@ -2070,7 +2155,7 @@ mod hybrid_search_tests {
 
     #[tokio::test]
     async fn test_hybrid_search_multiple_vector_routes_spark_shape() {
-        let (ctx, _tmp) = create_hybrid_search_context().await;
+        let (ctx, _catalog, _tmp) = create_hybrid_search_context().await;
         let batches = ctx
             .sql(
                 "SELECT id FROM hybrid_search( \
@@ -2094,6 +2179,49 @@ mod hybrid_search_tests {
             .collect()
             .await
             .expect("hybrid_search query should execute");
+
+        assert_eq!(extract_ids(&batches), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_branch() {
+        let (ctx, catalog, _tmp) = create_hybrid_search_context().await;
+        let identifier = Identifier::new("default", "test_java_vindex_vector");
+        let table = catalog.get_table(&identifier).await.expect("load table");
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .expect("load latest snapshot")
+            .expect("latest snapshot");
+        table
+            .tag_manager()
+            .create("branch-source", &snapshot)
+            .await
+            .expect("create tag");
+        BranchManager::new(table.file_io().clone(), table.location().to_string())
+            .create_branch_from_tag("b1", "branch-source")
+            .await
+            .expect("create branch");
+
+        let batches = ctx
+            .sql(
+                "SELECT id FROM hybrid_search( \
+                 'paimon.default.test_java_vindex_vector$branch_b1', \
+                 array(named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(1.0, 0.0, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0)), \
+                 array(), \
+                 3, \
+                 'rrf')",
+            )
+            .await
+            .expect("hybrid_search SQL should parse")
+            .collect()
+            .await
+            .expect("branch query should execute");
 
         assert_eq!(extract_ids(&batches), vec![0, 1, 2]);
     }

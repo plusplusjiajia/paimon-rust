@@ -128,6 +128,8 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if commit_messages.is_empty() {
             return Ok(());
         }
@@ -168,6 +170,8 @@ impl TableCommit {
         expected_snapshot_id: i64,
         commit_identifier: i64,
     ) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if commit_messages.is_empty() {
             return Ok(());
         }
@@ -217,6 +221,8 @@ impl TableCommit {
         static_partitions: Option<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
         }
@@ -450,6 +456,8 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if partitions.is_empty() {
             return Ok(());
         }
@@ -489,6 +497,8 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: "Partitions list cannot be empty.".to_string(),
@@ -507,6 +517,8 @@ impl TableCommit {
 
     /// Truncate the entire table with a caller-provided commit identifier.
     pub async fn truncate_table_with_identifier(&self, commit_identifier: i64) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         self.try_commit(
             CommitEntriesPlan::Overwrite {
                 partition_filter: None,
@@ -529,6 +541,8 @@ impl TableCommit {
     /// files or storage errors are ignored so abort cleanup never masks the
     /// original write failure.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         for message in commit_messages {
             let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
             for file in message

@@ -33,14 +33,18 @@ use crate::Result;
 /// matching the shape catalogs would otherwise return from a metastore.
 pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Partition>> {
     let file_io = table.file_io();
-    let sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
-    let snapshot = match sm.get_latest_snapshot().await? {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let snapshot_sm = table.snapshot_manager();
+    let manifest_sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
+    let snapshot = match table.travel_snapshot().cloned() {
+        Some(snapshot) => snapshot,
+        None => match snapshot_sm.get_latest_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        },
     };
 
-    let base_path = sm.manifest_path(snapshot.base_manifest_list());
-    let delta_path = sm.manifest_path(snapshot.delta_manifest_list());
+    let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());
+    let delta_path = manifest_sm.manifest_path(snapshot.delta_manifest_list());
     let (base_metas, delta_metas) = futures::try_join!(
         ManifestList::read(file_io, &base_path),
         ManifestList::read(file_io, &delta_path),
@@ -48,7 +52,7 @@ pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Parti
 
     let mut all_entries = Vec::new();
     for meta in base_metas.into_iter().chain(delta_metas) {
-        let manifest_path = sm.manifest_path(meta.file_name());
+        let manifest_path = manifest_sm.manifest_path(meta.file_name());
         let entries = Manifest::read(file_io, &manifest_path).await?;
         all_entries.extend(entries);
     }

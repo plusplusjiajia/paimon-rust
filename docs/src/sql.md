@@ -1636,11 +1636,22 @@ WHERE r.source = 'total';
 
 ### Branch References
 
-System tables support branch syntax:
+Read a table branch with Java-compatible `$branch_<name>` syntax:
 
 ```sql
-SELECT * FROM paimon.default.my_table$branch_main$options;
+SELECT * FROM paimon.default.my_table$branch_b1;
 ```
+
+System tables support the same branch syntax:
+
+```sql
+SELECT * FROM paimon.default.my_table$branch_b1$options;
+SELECT * FROM paimon.default.my_table$branch_b1$snapshots;
+```
+
+Branch references are read-only in DataFusion. `INSERT`, `UPDATE`, `DELETE`,
+`MERGE INTO`, `TRUNCATE TABLE`, and `ALTER TABLE` against a branch reference are
+rejected.
 
 ## Table Options
 

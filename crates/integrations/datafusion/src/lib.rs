@@ -55,6 +55,7 @@ mod sql_context;
 mod system_tables;
 mod table;
 mod table_function_args;
+mod table_loader;
 mod update;
 mod variant_functions;
 mod variant_pushdown;

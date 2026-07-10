@@ -51,6 +51,7 @@ use crate::table::{PaimonScanBuilder, PaimonTableProvider};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
+use crate::table_loader::load_data_table_for_read;
 
 const FUNCTION_NAME: &str = "hybrid_search";
 
@@ -123,10 +124,9 @@ impl TableFunctionImpl for HybridSearchFunction {
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
         let catalog = Arc::clone(&self.catalog);
         let table = block_on_with_runtime(
-            async move { catalog.get_table(&identifier).await },
+            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
             "hybrid_search: catalog access thread panicked",
-        )
-        .map_err(to_datafusion_error)?;
+        )?;
 
         Ok(Arc::new(HybridSearchTableProvider {
             inner: PaimonTableProvider::try_new(table)?,

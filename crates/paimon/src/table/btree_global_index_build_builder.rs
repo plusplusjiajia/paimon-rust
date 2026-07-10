@@ -68,6 +68,8 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(

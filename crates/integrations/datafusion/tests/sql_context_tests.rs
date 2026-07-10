@@ -17,17 +17,20 @@
 
 //! SQL context integration tests for paimon-datafusion.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use datafusion::arrow::array::Array;
+use async_trait::async_trait;
+use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
-use paimon::catalog::Identifier;
+use paimon::catalog::{list_partitions_from_file_system, Identifier};
 use paimon::spec::{
     ArrayType, BinaryType, BlobType, CharType, DataType, FloatType, IntType,
     LocalZonedTimestampType, MapType, MultisetType, SchemaChange, TimeType, VarBinaryType,
     VarCharType, VectorType,
 };
+use paimon::table::{BranchManager, SnapshotManager, TagManager};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
@@ -47,6 +50,207 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     ctx
 }
 
+struct PartitionCatalog {
+    inner: Arc<FileSystemCatalog>,
+    fail_list_partitions: AtomicBool,
+    partition_identifiers: Mutex<Vec<Identifier>>,
+}
+
+impl PartitionCatalog {
+    fn new(inner: Arc<FileSystemCatalog>) -> Self {
+        Self {
+            inner,
+            fail_list_partitions: AtomicBool::new(false),
+            partition_identifiers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_fail_list_partitions(&self, fail: bool) {
+        self.fail_list_partitions.store(fail, Ordering::SeqCst);
+    }
+
+    fn take_partition_identifiers(&self) -> Vec<Identifier> {
+        std::mem::take(&mut *self.partition_identifiers.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl Catalog for PartitionCatalog {
+    async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+        self.inner.list_databases().await
+    }
+
+    async fn create_database(
+        &self,
+        name: &str,
+        ignore_if_exists: bool,
+        properties: std::collections::HashMap<String, String>,
+    ) -> paimon::Result<()> {
+        self.inner
+            .create_database(name, ignore_if_exists, properties)
+            .await
+    }
+
+    async fn get_database(&self, name: &str) -> paimon::Result<paimon::catalog::Database> {
+        self.inner.get_database(name).await
+    }
+
+    async fn drop_database(
+        &self,
+        name: &str,
+        ignore_if_not_exists: bool,
+        cascade: bool,
+    ) -> paimon::Result<()> {
+        self.inner
+            .drop_database(name, ignore_if_not_exists, cascade)
+            .await
+    }
+
+    async fn get_table(&self, identifier: &Identifier) -> paimon::Result<paimon::table::Table> {
+        self.inner.get_table(identifier).await
+    }
+
+    async fn list_tables(&self, database_name: &str) -> paimon::Result<Vec<String>> {
+        self.inner.list_tables(database_name).await
+    }
+
+    async fn create_table(
+        &self,
+        identifier: &Identifier,
+        creation: paimon::spec::Schema,
+        ignore_if_exists: bool,
+    ) -> paimon::Result<()> {
+        self.inner
+            .create_table(identifier, creation, ignore_if_exists)
+            .await
+    }
+
+    async fn drop_table(
+        &self,
+        identifier: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        self.inner
+            .drop_table(identifier, ignore_if_not_exists)
+            .await
+    }
+
+    async fn rename_table(
+        &self,
+        from: &Identifier,
+        to: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        self.inner
+            .rename_table(from, to, ignore_if_not_exists)
+            .await
+    }
+
+    async fn alter_table(
+        &self,
+        identifier: &Identifier,
+        changes: Vec<SchemaChange>,
+        ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        self.inner
+            .alter_table(identifier, changes, ignore_if_not_exists)
+            .await
+    }
+
+    async fn list_partitions(
+        &self,
+        identifier: &Identifier,
+    ) -> paimon::Result<Vec<paimon::spec::Partition>> {
+        self.partition_identifiers
+            .lock()
+            .unwrap()
+            .push(identifier.clone());
+
+        let Some(branch) = identifier.branch_name()? else {
+            return self.inner.list_partitions(identifier).await;
+        };
+        if self.fail_list_partitions.load(Ordering::SeqCst) {
+            return Err(paimon::Error::Unsupported {
+                message: "injected list_partitions failure".to_string(),
+            });
+        }
+
+        let base = Identifier::new(identifier.database(), identifier.table_name()?);
+        let table = self.inner.get_table(&base).await?;
+        let table = table.copy_with_branch(&branch).await?;
+        let mut partitions = list_partitions_from_file_system(&table).await?;
+        for partition in &mut partitions {
+            partition.created_by = Some("catalog".to_string());
+        }
+        Ok(partitions)
+    }
+}
+
+async fn collect_ids(sql_context: &SQLContext, sql: &str) -> Vec<i32> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut ids = Vec::new();
+    for batch in batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id column");
+        for row in 0..batch.num_rows() {
+            ids.push(id_array.value(row));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+async fn collect_i64_column(sql_context: &SQLContext, sql: &str, column: &str) -> Vec<i64> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect(column);
+        for row in 0..batch.num_rows() {
+            values.push(array.value(row));
+        }
+    }
+    values.sort_unstable();
+    values
+}
+
+async fn collect_string_column(sql_context: &SQLContext, sql: &str, column: &str) -> Vec<String> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect(column);
+        for row in 0..batch.num_rows() {
+            if !array.is_null(row) {
+                values.push(array.value(row).to_string());
+            }
+        }
+    }
+    values.sort_unstable();
+    values
+}
+
+async fn assert_sql_error_contains(sql_context: &SQLContext, sql: &str, expected: &str) {
+    let err = match sql_context.sql(sql).await {
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("SQL should fail but succeeded")
+            .to_string(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains(expected),
+        "expected error containing '{expected}', got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_show_tables_is_enabled() {
     let (_tmp, catalog) = create_test_env();
@@ -59,6 +263,319 @@ async fn test_show_tables_is_enabled() {
         .collect()
         .await
         .expect("SHOW TABLES should execute");
+}
+
+#[tokio::test]
+async fn test_select_branch_table_reads_branch_snapshot() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE TABLE paimon.default.branch_orders (id INT, name STRING)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_orders VALUES (1, 'branch')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "branch_orders");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let tag_manager = TagManager::new(table.file_io().clone(), table.location().to_string());
+    tag_manager.create("branch_base", &snapshot).await.unwrap();
+    let branch_manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    branch_manager
+        .create_branch_from_tag("b1", "branch_base")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_orders VALUES (2, 'main')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_ids(&sql_context, "SELECT id FROM paimon.default.branch_orders").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collect_ids(
+            &sql_context,
+            "SELECT id FROM paimon.default.branch_orders$branch_b1"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT snapshot_id FROM paimon.default.branch_orders$snapshots",
+            "snapshot_id"
+        )
+        .await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT snapshot_id FROM paimon.default.branch_orders$branch_b1$snapshots",
+            "snapshot_id"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT record_count FROM paimon.default.branch_orders$files VERSION AS OF 'branch_base'",
+            "record_count"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT record_count FROM paimon.default.branch_orders$branch_b1$files VERSION AS OF 'branch_base'",
+            "record_count"
+        )
+        .await,
+        vec![1]
+    );
+    assert!(!collect_string_column(
+        &sql_context,
+        "SELECT file_name FROM paimon.default.branch_orders$branch_b1$manifests",
+        "file_name",
+    )
+    .await
+    .is_empty());
+
+    let branch_table = table.copy_with_branch("b1").await.unwrap();
+    let write_builder = branch_table.new_write_builder();
+    assert!(write_builder.new_write().is_err());
+    assert!(write_builder.new_update(vec!["name".to_string()]).is_err());
+    assert!(write_builder.new_delete().is_err());
+    assert!(write_builder.try_new_commit().is_err());
+
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT INTO paimon.default.branch_orders$branch_b1 VALUES (3, 'blocked')",
+        "Writing to Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT INTO paimon.default.branch_orders$branch_main VALUES (3, 'blocked')",
+        "Writing to Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "UPDATE paimon.default.branch_orders$branch_b1 SET name = 'blocked' WHERE id = 1",
+        "UPDATE on Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "UPDATE paimon.default.branch_orders$branch_main SET name = 'blocked' WHERE id = 1",
+        "UPDATE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "DELETE FROM paimon.default.branch_orders$branch_b1 WHERE id = 1",
+        "DELETE on Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "DELETE FROM paimon.default.branch_orders$branch_main WHERE id = 1",
+        "DELETE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "MERGE INTO paimon.default.branch_orders$branch_main AS target \
+         USING (SELECT 1 AS id, 'blocked' AS name) AS source \
+         ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET name = source.name",
+        "MERGE INTO on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "TRUNCATE TABLE paimon.default.branch_orders$branch_main",
+        "TRUNCATE TABLE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "ALTER TABLE paimon.default.branch_orders$branch_main ADD COLUMN blocked INT",
+        "ALTER TABLE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT OVERWRITE paimon.default.branch_orders$branch_main \
+         PARTITION (id = 1) SELECT 'blocked'",
+        "INSERT OVERWRITE on Paimon branch 'main' is not supported",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_branch_partitions_system_table_reads_branch_snapshot() {
+    let (_tmp, file_catalog) = create_test_env();
+    let catalog = Arc::new(PartitionCatalog::new(file_catalog.clone()));
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.default.branch_partition_orders \
+             (id INT, name STRING) PARTITIONED BY (id)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_partition_orders VALUES (1, 'branch')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "branch_partition_orders");
+    let table = file_catalog.get_table(&identifier).await.unwrap();
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let tag_manager = TagManager::new(table.file_io().clone(), table.location().to_string());
+    tag_manager
+        .create("partition_branch_base", &snapshot)
+        .await
+        .unwrap();
+    let branch_manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    branch_manager
+        .create_branch_from_tag("b1", "partition_branch_base")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_partition_orders VALUES (2, 'main')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string(), "id=2".to_string()]
+    );
+    catalog.take_partition_identifiers();
+
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT created_by FROM paimon.default.branch_partition_orders$branch_b1$partitions",
+            "created_by",
+        )
+        .await,
+        vec!["catalog".to_string()]
+    );
+    assert_eq!(
+        catalog.take_partition_identifiers(),
+        vec![Identifier::new(
+            "default",
+            "branch_partition_orders$branch_b1"
+        )]
+    );
+
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_main$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string(), "id=2".to_string()]
+    );
+    assert_eq!(
+        catalog.take_partition_identifiers(),
+        vec![Identifier::new("default", "branch_partition_orders")]
+    );
+
+    catalog.set_fail_list_partitions(true);
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_b1$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
+    assert_eq!(
+        catalog.take_partition_identifiers(),
+        vec![Identifier::new(
+            "default",
+            "branch_partition_orders$branch_b1"
+        )]
+    );
+
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$partitions \
+             VERSION AS OF 'partition_branch_base'",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_b1$partitions \
+             VERSION AS OF 'partition_branch_base'",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
+    assert!(catalog.take_partition_identifiers().is_empty());
 }
 
 // ======================= CREATE / DROP SCHEMA =======================

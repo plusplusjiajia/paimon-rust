@@ -71,6 +71,8 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if !is_lumina_index_type(&self.index_type) {
             return Err(Error::DataInvalid {
                 message: format!("Unsupported Lumina index type: {}", self.index_type),

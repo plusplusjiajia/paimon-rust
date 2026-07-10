@@ -92,7 +92,7 @@ impl DataSink for PaimonDataSink {
         }
 
         let messages = tw.prepare_commit().await.map_err(to_datafusion_error)?;
-        let commit = wb.new_commit();
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
 
         if self.overwrite {
             commit

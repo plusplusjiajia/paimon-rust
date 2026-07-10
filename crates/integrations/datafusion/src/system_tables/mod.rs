@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use paimon::catalog::{Catalog, Identifier, SYSTEM_BRANCH_PREFIX, SYSTEM_TABLE_SPLITTER};
+use paimon::catalog::{parse_object_name, Catalog, Identifier, ParsedObjectName};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -74,36 +74,16 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "tags",
 ];
 
-/// Parse a Paimon object name into `(base_table, optional system_table_name)`.
+/// Parse a Paimon object name into table, branch, and optional system table.
 ///
 /// Mirrors Java [Identifier.splitObjectName](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java).
 ///
-/// - `t` → `("t", None)`
-/// - `t$options` → `("t", Some("options"))`
-/// - `t$branch_main` → `("t", None)` (branch reference, not a system table)
-/// - `t$branch_main$options` → `("t", Some("options"))` (branch + system table)
-pub(crate) fn split_object_name(name: &str) -> (&str, Option<&str>) {
-    let mut parts = name.splitn(3, SYSTEM_TABLE_SPLITTER);
-    let base = parts.next().unwrap_or(name);
-    match (parts.next(), parts.next()) {
-        (None, _) => (base, None),
-        (Some(second), None) => {
-            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
-                (base, None)
-            } else {
-                (base, Some(second))
-            }
-        }
-        (Some(second), Some(third)) => {
-            if second.starts_with(SYSTEM_BRANCH_PREFIX) {
-                (base, Some(third))
-            } else {
-                // `$` is legal in table names, so `t$foo$bar` falls through as
-                // plain `t` and errors later as "table not found".
-                (base, None)
-            }
-        }
-    }
+/// - `t` → table `t`
+/// - `t$options` → table `t`, system table `options`
+/// - `t$branch_b1` → table `t`, branch `b1`
+/// - `t$branch_b1$options` → table `t`, branch `b1`, system table `options`
+pub(crate) fn parse_object_name_for_datafusion(name: &str) -> DFResult<ParsedObjectName> {
+    parse_object_name(name).map_err(to_datafusion_error)
 }
 
 /// Returns true if `name` is a recognised Paimon system table suffix.
@@ -121,6 +101,27 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .map(|(_, build)| build(base_table))
 }
 
+pub(crate) fn provider_for_table(
+    catalog: Arc<dyn Catalog>,
+    identifier: Identifier,
+    table: Table,
+    system_name: &str,
+) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    if !is_registered(system_name) {
+        return Ok(None);
+    }
+    // Fail closed: system tables expose file metadata the client can't authorize.
+    paimon::spec::CoreOptions::new(table.schema().options())
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
+    if system_name.eq_ignore_ascii_case("partitions") {
+        return partitions::build(catalog, identifier, table).map(Some);
+    }
+    wrap_to_system_table(system_name, table)
+        .expect("is_registered guarantees a builder")
+        .map(Some)
+}
+
 /// Loads `<base>$<system_name>` from the catalog and wraps it as a system
 /// table provider.
 ///
@@ -130,29 +131,29 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
 pub(crate) async fn load(
     catalog: Arc<dyn Catalog>,
     database: String,
-    base: String,
+    object: ParsedObjectName,
     system_name: String,
 ) -> DFResult<Option<Arc<dyn TableProvider>>> {
     if !is_registered(&system_name) {
         return Ok(None);
     }
-    let identifier = Identifier::new(database, base.clone());
+    let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
-        Ok(table) => {
-            // Fail closed: system tables expose file metadata the client can't authorize.
-            paimon::spec::CoreOptions::new(table.schema().options())
-                .ensure_read_authorized()
-                .map_err(to_datafusion_error)?;
-            if system_name.eq_ignore_ascii_case("partitions") {
-                return partitions::build(catalog, identifier, table).map(Some);
+        Ok(mut table) => {
+            if let Some(branch) = object.branch() {
+                if !system_name.eq_ignore_ascii_case("branches") {
+                    table = table
+                        .copy_with_branch(branch)
+                        .await
+                        .map_err(to_datafusion_error)?;
+                }
             }
-            wrap_to_system_table(&system_name, table)
-                .expect("is_registered guarantees a builder")
-                .map(Some)
+            provider_for_table(catalog, identifier, table, &system_name)
         }
         Err(paimon::Error::TableNotExist { .. }) => Err(DataFusionError::Plan(format!(
             "Cannot read system table `${system_name}`: \
-             base table `{base}` does not exist"
+             base table `{}` does not exist",
+            object.table()
         ))),
         Err(e) => Err(to_datafusion_error(e)),
     }
@@ -160,7 +161,7 @@ pub(crate) async fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_registered, split_object_name, SYSTEM_TABLE_NAMES, TABLES};
+    use super::{is_registered, parse_object_name_for_datafusion, SYSTEM_TABLE_NAMES, TABLES};
 
     /// Guards against the two registries drifting: anything in `TABLES` must
     /// also be in `SYSTEM_TABLE_NAMES`, and the only name allowed to be in
@@ -214,40 +215,54 @@ mod tests {
 
     #[test]
     fn plain_table_name() {
-        assert_eq!(split_object_name("orders"), ("orders", None));
+        let parsed = parse_object_name_for_datafusion("orders").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), None);
+        assert_eq!(parsed.system_table(), None);
     }
 
     #[test]
     fn system_table_only() {
-        assert_eq!(
-            split_object_name("orders$options"),
-            ("orders", Some("options"))
-        );
+        let parsed = parse_object_name_for_datafusion("orders$options").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), None);
+        assert_eq!(parsed.system_table(), Some("options"));
     }
 
     #[test]
     fn branch_reference_is_not_a_system_table() {
-        assert_eq!(split_object_name("orders$branch_main"), ("orders", None));
+        let parsed = parse_object_name_for_datafusion("orders$branch_main").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), Some("main"));
+        assert_eq!(parsed.system_table(), None);
+    }
+
+    #[test]
+    fn branch_reference_does_not_drop_branch_name() {
+        let parsed = parse_object_name_for_datafusion("orders$branch_b1").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), Some("b1"));
+        assert_eq!(parsed.system_table(), None);
     }
 
     #[test]
     fn branch_plus_system_table() {
-        assert_eq!(
-            split_object_name("orders$branch_main$options"),
-            ("orders", Some("options"))
-        );
+        let parsed = parse_object_name_for_datafusion("orders$branch_main$options").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), Some("main"));
+        assert_eq!(parsed.system_table(), Some("options"));
     }
 
     #[test]
     fn three_parts_without_branch_prefix_is_not_a_system_table() {
-        assert_eq!(split_object_name("orders$foo$bar"), ("orders", None));
+        assert!(parse_object_name_for_datafusion("orders$foo$bar").is_err());
     }
 
     #[test]
     fn system_table_name_preserves_case() {
-        assert_eq!(
-            split_object_name("orders$Options"),
-            ("orders", Some("Options"))
-        );
+        let parsed = parse_object_name_for_datafusion("orders$Options").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), None);
+        assert_eq!(parsed.system_table(), Some("Options"));
     }
 }

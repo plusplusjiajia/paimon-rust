@@ -28,7 +28,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::{SnapshotManager, Table};
+use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
@@ -86,10 +86,7 @@ impl TableProvider for SnapshotsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let sm = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let sm = self.table.snapshot_manager();
         let snapshots = crate::runtime::await_with_runtime(async move { sm.list_all().await })
             .await
             .map_err(to_datafusion_error)?;

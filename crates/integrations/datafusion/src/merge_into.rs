@@ -396,7 +396,8 @@ async fn execute_cow_merge_once(
     all_messages.extend(insert_messages);
 
     if !all_messages.is_empty() {
-        wb.new_commit()
+        wb.try_new_commit()
+            .map_err(to_datafusion_error)?
             .commit(all_messages)
             .await
             .map_err(to_datafusion_error)?;
@@ -771,7 +772,8 @@ async fn execute_merge_into_once(
 
     // 6. Commit all messages atomically
     if !all_messages.is_empty() {
-        wb.new_commit()
+        wb.try_new_commit()
+            .map_err(to_datafusion_error)?
             .commit(all_messages)
             .await
             .map_err(to_datafusion_error)?;

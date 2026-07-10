@@ -23,7 +23,10 @@ mod common;
 
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
 use common::{create_sql_context, create_test_env, exec};
+use paimon::catalog::Identifier;
 use paimon::spec::{BlobDescriptor, BlobViewStruct};
+use paimon::table::BranchManager;
+use paimon::Catalog;
 use paimon_datafusion::SQLContext;
 
 // ======================= Helpers =======================
@@ -870,6 +873,73 @@ async fn test_blob_view_without_rest_env_preserves_reference() {
     assert_eq!(view1.row_id(), 1);
 
     drop(tmp);
+}
+
+#[tokio::test]
+async fn test_blob_view_preserves_branch_reference() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.src (\
+                id INT, \
+                picture BLOB\
+             ) WITH (\
+                'data-evolution.enabled' = 'true', \
+                'row-tracking.enabled' = 'true'\
+             )",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.src (id, picture) VALUES (1, X'616C696365')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "src"))
+        .await
+        .expect("load table");
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .expect("load latest snapshot")
+        .expect("latest snapshot");
+    table
+        .tag_manager()
+        .create("branch-source", &snapshot)
+        .await
+        .expect("create tag");
+    BranchManager::new(table.file_io().clone(), table.location().to_string())
+        .create_branch_from_tag("b1", "branch-source")
+        .await
+        .expect("create branch");
+
+    let batches = sql_context
+        .sql(
+            "SELECT blob_view('test_db.src$branch_b1', 'picture', \"_ROW_ID\") AS picture \
+             FROM paimon.test_db.src",
+        )
+        .await
+        .expect("blob_view SQL should parse")
+        .collect()
+        .await
+        .expect("branch blob_view should execute");
+    let value = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("binary blob view")
+        .value(0);
+    let view = BlobViewStruct::deserialize(value).expect("deserialize blob view");
+    assert_eq!(view.identifier().full_name(), "test_db.src$branch_b1");
+    assert_eq!(view.row_id(), 0);
 }
 
 #[tokio::test]

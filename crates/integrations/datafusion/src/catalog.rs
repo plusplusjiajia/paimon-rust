@@ -364,13 +364,13 @@ impl SchemaProvider for PaimonSchemaProvider {
             }
         }
 
-        let (base, system_name) = system_tables::split_object_name(name);
-        if let Some(system_name) = system_name {
+        let object = system_tables::parse_object_name_for_datafusion(name)?;
+        if let Some(system_name) = object.system_table().map(str::to_string) {
             return await_with_runtime(system_tables::load(
                 Arc::clone(&self.catalog),
                 self.database.clone(),
-                base.to_string(),
-                system_name.to_string(),
+                object,
+                system_name,
             ))
             .await;
         }
@@ -378,10 +378,17 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
-        let identifier = Identifier::new(self.database.clone(), base);
+        let identifier = Identifier::new(self.database.clone(), object.table().to_string());
+        let branch = object.branch().map(str::to_string);
         await_with_runtime(async move {
             match catalog.get_table(&identifier).await {
-                Ok(table) => {
+                Ok(mut table) => {
+                    if let Some(branch) = branch.as_deref() {
+                        table = table
+                            .copy_with_branch(branch)
+                            .await
+                            .map_err(to_datafusion_error)?;
+                    }
                     let opts = dynamic_options.read().unwrap().clone();
                     let provider = if opts.is_empty() {
                         PaimonTableProvider::try_new_with_blob_reader_registry(
@@ -419,19 +426,38 @@ impl SchemaProvider for PaimonSchemaProvider {
             }
         }
 
-        let (base, system_name) = system_tables::split_object_name(name);
-        if let Some(system_name) = system_name {
+        let object = match system_tables::parse_object_name_for_datafusion(name) {
+            Ok(object) => object,
+            Err(e) => {
+                log::error!("failed to parse Paimon object name '{name}': {e}");
+                return false;
+            }
+        };
+        if let Some(system_name) = object.system_table() {
             if !system_tables::is_registered(system_name) {
                 return false;
             }
         }
 
         let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), base.to_string());
+        let identifier = Identifier::new(self.database.clone(), object.table().to_string());
+        let branch = object.branch().map(str::to_string);
+        let is_branches_table = object
+            .system_table()
+            .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
         block_on_with_runtime(
             async move {
                 match catalog.get_table(&identifier).await {
-                    Ok(_) => true,
+                    Ok(table) => {
+                        if let Some(branch) = branch.as_deref() {
+                            if is_branches_table {
+                                return true;
+                            }
+                            table.copy_with_branch(branch).await.is_ok()
+                        } else {
+                            true
+                        }
+                    }
                     Err(paimon::Error::TableNotExist { .. }) => false,
                     Err(e) => {
                         log::error!("failed to check table '{}': {e}", identifier);

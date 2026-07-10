@@ -17,7 +17,6 @@
 
 //! Snapshot resolution for time travel, mirroring Java `TimeTravelUtil`.
 
-use crate::io::FileIO;
 use crate::spec::{CoreOptions, Snapshot, TimeTravelSelector};
 use crate::table::SnapshotManager;
 use crate::table::TagManager;
@@ -31,12 +30,11 @@ use std::collections::HashMap;
 /// match any snapshot — callers that need Java `tryTravelToSnapshot`'s silent
 /// fallback (keep the current schema on failure) handle the `Err` themselves.
 pub(crate) async fn travel_to_snapshot(
-    file_io: &FileIO,
-    table_path: &str,
+    snapshot_manager: &SnapshotManager,
+    tag_manager: &TagManager,
     options: &HashMap<String, String>,
 ) -> crate::Result<Option<Snapshot>> {
     let core_options = CoreOptions::new(options);
-    let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
 
     match core_options.try_time_travel_selector()? {
         Some(TimeTravelSelector::TimestampMillis(ts)) => {
@@ -53,9 +51,8 @@ pub(crate) async fn travel_to_snapshot(
             option_name,
         }) => {
             // `scan.version` is ambiguous by design: tag first, then snapshot id.
-            let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
             if tag_manager.tag_exists(v).await? {
-                resolve_tag(&tag_manager, v).await.map(Some)
+                resolve_tag(tag_manager, v).await.map(Some)
             } else if let Ok(id) = v.parse::<i64>() {
                 snapshot_manager.get_snapshot(id).await.map(Some)
             } else {
@@ -83,9 +80,8 @@ pub(crate) async fn travel_to_snapshot(
             option_name: _,
         }) => {
             // An explicit tag name: resolve strictly by tag, never as a snapshot id.
-            let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
             if tag_manager.tag_exists(v).await? {
-                resolve_tag(&tag_manager, v).await.map(Some)
+                resolve_tag(tag_manager, v).await.map(Some)
             } else {
                 Err(Error::DataInvalid {
                     message: format!("Tag '{v}' doesn't exist."),
@@ -415,7 +411,9 @@ mod tests {
     async fn test_invalid_snapshot_id_error_names_original_option() {
         let (file_io, table_path) = setup_evolved_table().await;
         let opts = options(&[("scan.snapshot-id", "abc")]);
-        let err = super::travel_to_snapshot(&file_io, &table_path, &opts)
+        let sm = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let tm = TagManager::new(file_io.clone(), table_path.clone());
+        let err = super::travel_to_snapshot(&sm, &tm, &opts)
             .await
             .expect_err("non-numeric snapshot-id must fail");
         match err {
@@ -545,13 +543,9 @@ mod tests {
 
         // scan.snapshot-id must only accept a numeric snapshot id; it must not
         // fall back to resolving a tag of the same name.
-        let err = super::travel_to_snapshot(
-            &file_io,
-            &table_path,
-            &options(&[("scan.snapshot-id", "v1-tag")]),
-        )
-        .await
-        .expect_err("scan.snapshot-id must not resolve a tag name");
+        let err = super::travel_to_snapshot(&sm, &tm, &options(&[("scan.snapshot-id", "v1-tag")]))
+            .await
+            .expect_err("scan.snapshot-id must not resolve a tag name");
         assert!(
             matches!(err, crate::Error::DataInvalid { ref message, .. }
                 if message.contains("scan.snapshot-id")),
@@ -563,10 +557,11 @@ mod tests {
     async fn test_tag_name_selector_rejects_snapshot_id() {
         let (file_io, table_path) = setup_evolved_table().await;
         // No tag named "1" exists, but snapshot 1 does.
-        let err =
-            super::travel_to_snapshot(&file_io, &table_path, &options(&[("scan.tag-name", "1")]))
-                .await
-                .expect_err("scan.tag-name must not resolve a snapshot id");
+        let sm = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let tm = TagManager::new(file_io.clone(), table_path.clone());
+        let err = super::travel_to_snapshot(&sm, &tm, &options(&[("scan.tag-name", "1")]))
+            .await
+            .expect_err("scan.tag-name must not resolve a snapshot id");
         assert!(
             matches!(err, crate::Error::DataInvalid { ref message, .. }
                 if message.contains("Tag '1'")),

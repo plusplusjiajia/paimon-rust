@@ -62,6 +62,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        self.table.ensure_not_branch_reference_for_write()?;
+
         if !is_vindex_index_type(&self.index_type) {
             return Err(Error::DataInvalid {
                 message: format!("Unsupported vindex index type: {}", self.index_type),

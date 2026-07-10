@@ -68,6 +68,35 @@ pub struct Identifier {
     object: String,
 }
 
+/// Parsed form of a Paimon object name.
+///
+/// Mirrors Java `Identifier.splitObjectName`: `table$branch_b1$snapshots`
+/// resolves to table `table`, branch `b1`, and system table `snapshots`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedObjectName {
+    table: String,
+    branch: Option<String>,
+    system_table: Option<String>,
+}
+
+impl ParsedObjectName {
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    pub fn branch_or_default(&self) -> &str {
+        self.branch.as_deref().unwrap_or(DEFAULT_MAIN_BRANCH)
+    }
+
+    pub fn system_table(&self) -> Option<&str> {
+        self.system_table.as_deref()
+    }
+}
+
 impl Identifier {
     /// Create an identifier from database and object name.
     pub fn new(database: impl Into<String>, object: impl Into<String>) -> Self {
@@ -112,6 +141,79 @@ impl Identifier {
             format!("{}.{}", self.database, self.object)
         }
     }
+
+    /// Parse the object name into table, branch, and system-table components.
+    pub fn parsed_object_name(&self) -> Result<ParsedObjectName> {
+        parse_object_name(&self.object)
+    }
+
+    pub fn table_name(&self) -> Result<String> {
+        Ok(self.parsed_object_name()?.table)
+    }
+
+    pub fn branch_name(&self) -> Result<Option<String>> {
+        Ok(self.parsed_object_name()?.branch)
+    }
+
+    pub fn branch_name_or_default(&self) -> Result<String> {
+        Ok(self
+            .branch_name()?
+            .unwrap_or_else(|| DEFAULT_MAIN_BRANCH.to_string()))
+    }
+
+    pub fn system_table_name(&self) -> Result<Option<String>> {
+        Ok(self.parsed_object_name()?.system_table)
+    }
+}
+
+/// Parse a Paimon object name into table, optional branch, and optional system table.
+pub fn parse_object_name(object: &str) -> Result<ParsedObjectName> {
+    let parts: Vec<&str> = object.split(SYSTEM_TABLE_SPLITTER).collect();
+    let invalid = || Error::IdentifierInvalid {
+        message: format!("Invalid object name: {object}"),
+    };
+    let branch_from = |part: &str| {
+        let branch = part
+            .strip_prefix(SYSTEM_BRANCH_PREFIX)
+            .ok_or_else(invalid)?;
+        if branch.trim().is_empty() {
+            return Err(Error::IdentifierInvalid {
+                message: format!("Branch name cannot be empty in object name: {object}"),
+            });
+        }
+        validate_branch_name(branch)?;
+        Ok(branch.to_string())
+    };
+
+    match parts.as_slice() {
+        [table] => Ok(ParsedObjectName {
+            table: (*table).to_string(),
+            branch: None,
+            system_table: None,
+        }),
+        [table, second] if second.starts_with(SYSTEM_BRANCH_PREFIX) => Ok(ParsedObjectName {
+            table: (*table).to_string(),
+            branch: Some(branch_from(second)?),
+            system_table: None,
+        }),
+        [table, system_table] => Ok(ParsedObjectName {
+            table: (*table).to_string(),
+            branch: None,
+            system_table: Some((*system_table).to_string()),
+        }),
+        [table, branch, system_table] if branch.starts_with(SYSTEM_BRANCH_PREFIX) => {
+            Ok(ParsedObjectName {
+                table: (*table).to_string(),
+                branch: Some(branch_from(branch)?),
+                system_table: Some((*system_table).to_string()),
+            })
+        }
+        _ => Err(invalid()),
+    }
+}
+
+pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
+    validate_identifier_name("branch", name)
 }
 
 fn validate_identifier_name(kind: &str, name: &str) -> Result<()> {
@@ -299,6 +401,43 @@ pub trait Catalog: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_plain_object_name() {
+        let parsed = parse_object_name("orders").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), None);
+        assert_eq!(parsed.branch_or_default(), DEFAULT_MAIN_BRANCH);
+        assert_eq!(parsed.system_table(), None);
+    }
+
+    #[test]
+    fn parses_branch_object_name() {
+        let parsed = parse_object_name("orders$branch_b1").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), Some("b1"));
+        assert_eq!(parsed.system_table(), None);
+    }
+
+    #[test]
+    fn parses_branch_system_table_object_name() {
+        let parsed = parse_object_name("orders$branch_b1$snapshots").unwrap();
+        assert_eq!(parsed.table(), "orders");
+        assert_eq!(parsed.branch(), Some("b1"));
+        assert_eq!(parsed.system_table(), Some("snapshots"));
+    }
+
+    #[test]
+    fn rejects_invalid_three_part_object_name() {
+        assert!(parse_object_name("orders$foo$bar").is_err());
+    }
+
+    #[test]
+    fn rejects_path_unsafe_branch_name() {
+        assert!(parse_object_name("orders$branch_../../other").is_err());
+        assert!(parse_object_name("orders$branch_nested/name").is_err());
+        assert!(parse_object_name("orders$branch_..").is_err());
+    }
 
     #[test]
     fn test_identifier_validate_should_reject_path_control_names() {

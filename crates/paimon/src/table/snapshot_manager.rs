@@ -18,6 +18,7 @@
 //! Snapshot manager for reading snapshot metadata using FileIO.
 //!
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
+use crate::catalog::DEFAULT_MAIN_BRANCH;
 use crate::io::FileIO;
 use crate::spec::Snapshot;
 use futures::future::try_join_all;
@@ -35,6 +36,7 @@ const EARLIEST_HINT: &str = "EARLIEST";
 pub struct SnapshotManager {
     file_io: FileIO,
     table_path: String,
+    branch: String,
 }
 
 impl SnapshotManager {
@@ -43,6 +45,7 @@ impl SnapshotManager {
         Self {
             file_io,
             table_path,
+            branch: DEFAULT_MAIN_BRANCH.to_string(),
         }
     }
 
@@ -52,13 +55,26 @@ impl SnapshotManager {
 
     /// Path to the snapshot directory (e.g. `table_path/snapshot`).
     pub fn snapshot_dir(&self) -> String {
-        format!("{}/{}", self.table_path, SNAPSHOT_DIR)
+        let branch_path = if self.branch == DEFAULT_MAIN_BRANCH {
+            self.table_path.clone()
+        } else {
+            format!("{}/branch/branch-{}", self.table_path, self.branch)
+        };
+        format!("{branch_path}/{SNAPSHOT_DIR}")
     }
 
     /// Create a SnapshotManager for a branch of this table.
     pub fn with_branch(&self, branch_name: &str) -> Self {
-        let branch_path = format!("{}/branch/branch-{}", self.table_path, branch_name);
-        Self::new(self.file_io.clone(), branch_path)
+        let branch = if branch_name.trim().is_empty() {
+            DEFAULT_MAIN_BRANCH
+        } else {
+            branch_name
+        };
+        Self {
+            file_io: self.file_io.clone(),
+            table_path: self.table_path.clone(),
+            branch: branch.to_string(),
+        }
     }
 
     /// Path to the LATEST hint file.
@@ -502,5 +518,40 @@ mod tests {
         let snaps = sm.list_all().await.unwrap();
         let ids: Vec<i64> = snaps.iter().map(|s| s.id()).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_branch_scopes_snapshot_paths_only() {
+        let sm = SnapshotManager::new(test_file_io(), "memory:/test_branch_paths".to_string());
+        let branch_sm = sm.with_branch("b1");
+
+        assert_eq!(
+            branch_sm.snapshot_path(1),
+            "memory:/test_branch_paths/branch/branch-b1/snapshot/snapshot-1"
+        );
+        assert_eq!(
+            branch_sm.latest_hint_path(),
+            "memory:/test_branch_paths/branch/branch-b1/snapshot/LATEST"
+        );
+        assert_eq!(
+            branch_sm.manifest_path("manifest-list-1"),
+            "memory:/test_branch_paths/manifest/manifest-list-1"
+        );
+
+        let other_branch_sm = branch_sm.with_branch("b2");
+        assert_eq!(
+            other_branch_sm.snapshot_dir(),
+            "memory:/test_branch_paths/branch/branch-b2/snapshot"
+        );
+        assert_eq!(
+            other_branch_sm.manifest_dir(),
+            "memory:/test_branch_paths/manifest"
+        );
+        assert_eq!(
+            other_branch_sm
+                .with_branch(DEFAULT_MAIN_BRANCH)
+                .snapshot_dir(),
+            "memory:/test_branch_paths/snapshot"
+        );
     }
 }

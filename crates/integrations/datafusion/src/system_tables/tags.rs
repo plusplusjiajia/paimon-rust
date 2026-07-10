@@ -30,7 +30,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::{Table, TagManager};
+use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
@@ -85,10 +85,7 @@ impl TableProvider for TagsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let tm = TagManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let tm = self.table.tag_manager();
         let tags = crate::runtime::await_with_runtime(async move { tm.list_all().await })
             .await
             .map_err(to_datafusion_error)?;

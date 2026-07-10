@@ -26,7 +26,6 @@ use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
-use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
@@ -219,10 +218,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let snapshot_manager = self.table.snapshot_manager();
 
         let snapshot = match snapshot_manager.get_latest_snapshot().await? {
             Some(s) => s,
@@ -231,11 +227,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
         let index_entries = match snapshot.index_manifest() {
             Some(index_manifest_name) => {
-                let manifest_path = format!(
-                    "{}/manifest/{}",
-                    self.table.location().trim_end_matches('/'),
-                    index_manifest_name
-                );
+                let manifest_path = snapshot_manager.manifest_path(index_manifest_name);
                 IndexManifest::read(self.table.file_io(), &manifest_path).await?
             }
             None => Vec::new(),
