@@ -100,7 +100,9 @@ impl<'a> FullTextSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let text_column =
             self.text_column
                 .as_deref()

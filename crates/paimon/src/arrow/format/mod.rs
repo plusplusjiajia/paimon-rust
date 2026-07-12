@@ -19,7 +19,7 @@ mod avro;
 pub(crate) mod blob;
 mod mosaic;
 mod orc;
-mod parquet;
+pub(crate) mod parquet;
 mod row;
 mod shredding;
 #[cfg(feature = "vortex")]

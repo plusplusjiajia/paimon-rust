@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 
-use crate::spec::CoreOptions;
 use crate::table::{RowRange, Table};
 use crate::vector_search::SearchResult;
 
@@ -265,7 +264,9 @@ impl<'a> HybridSearchBuilder<'a> {
     }
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;

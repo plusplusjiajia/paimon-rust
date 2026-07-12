@@ -42,6 +42,7 @@ use crate::table::bin_pack::split_for_batch;
 use crate::table::merge_tree_split_generator::{
     merge_tree_split_for_batch, KeyComparator, SplitGroup,
 };
+use crate::table::query_auth::QueryAuthGrant;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
@@ -680,6 +681,21 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    pub(super) fn with_query_auth_scope(
+        self,
+        filter_columns: HashSet<usize>,
+        projected: Option<Vec<usize>>,
+    ) -> Self {
+        match self.0 {
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(
+                scan.with_query_auth_scope(filter_columns, projected),
+            )),
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(
+                scan.with_query_auth_scope(filter_columns, projected),
+            )),
+        }
+    }
+
     pub async fn plan(&self) -> crate::Result<Plan> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.plan().await,
@@ -710,7 +726,7 @@ impl<'a> TableScan<'a> {
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.apply_limit_pushdown(splits),
-            TableScanKind::Format(scan) => scan.apply_limit_pushdown(splits),
+            TableScanKind::Format(scan) => scan.apply_limit_pushdown(splits, false),
         }
     }
 }
@@ -733,6 +749,10 @@ struct PaimonTableScan<'a> {
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
     projected_read_field_ids: Option<HashSet<i32>>,
+    /// Filter/projection columns for the query-auth scope check, evaluated
+    /// against the live grant at plan time (see `ensure_query_auth_allowed`).
+    query_auth_filter_columns: HashSet<usize>,
+    query_auth_projected: Option<Vec<usize>>,
 }
 
 impl<'a> PaimonTableScan<'a> {
@@ -753,6 +773,8 @@ impl<'a> PaimonTableScan<'a> {
             row_ranges,
             scan_all_files: false,
             projected_read_field_ids: None,
+            query_auth_filter_columns: HashSet::new(),
+            query_auth_projected: None,
         }
     }
 
@@ -787,6 +809,16 @@ impl<'a> PaimonTableScan<'a> {
         self
     }
 
+    pub(super) fn with_query_auth_scope(
+        mut self,
+        filter_columns: HashSet<usize>,
+        projected: Option<Vec<usize>>,
+    ) -> Self {
+        self.query_auth_filter_columns = filter_columns;
+        self.query_auth_projected = projected;
+        self
+    }
+
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
@@ -803,27 +835,40 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        let grant = self.ensure_query_auth_allowed().await?;
+        let has_row_filter = grant.as_deref().is_some_and(|g| g.has_row_filter());
+        let data_evolution_read_field_ids = self.auth_widened_read_field_ids(grant.as_deref());
         let snapshot = match self.resolve_snapshot().await? {
             Some(snapshot) => snapshot,
-            None => return Ok(Plan::new(Vec::new())),
+            None => return Ok(self.finalize_plan(Plan::new(Vec::new()), grant.as_ref())),
         };
-        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
-            .await
+        self.plan_snapshot(
+            snapshot,
+            data_evolution_read_field_ids.as_ref(),
+            None,
+            has_row_filter,
+        )
+        .await
+        .map(|plan| self.finalize_plan(plan, grant.as_ref()))
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
+        let grant = self.ensure_query_auth_allowed().await?;
+        let has_row_filter = grant.as_deref().is_some_and(|g| g.has_row_filter());
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
         };
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        let data_evolution_read_field_ids = self.auth_widened_read_field_ids(grant.as_deref());
         let snapshot = match self.resolve_snapshot().await? {
             Some(snapshot) => snapshot,
-            None => return Ok((Plan::new(Vec::new()), trace)),
+            None => {
+                return Ok((
+                    self.finalize_plan(Plan::new(Vec::new()), grant.as_ref()),
+                    trace,
+                ))
+            }
         };
         trace.snapshot_id = Some(snapshot.id());
         let plan = self
@@ -831,20 +876,66 @@ impl<'a> PaimonTableScan<'a> {
                 snapshot,
                 data_evolution_read_field_ids.as_ref(),
                 Some(&mut trace),
+                has_row_filter,
             )
             .await?;
-        Ok((plan, trace))
+        Ok((self.finalize_plan(plan, grant.as_ref()), trace))
+    }
+
+    /// Stamp the grant onto every split (so `TableRead::to_arrow` enforces
+    /// exactly this plan's grant) and mark row counts inexact when it carries a
+    /// row filter (dropped as a residual pass inside `TableRead`).
+    fn finalize_plan(&self, plan: Plan, grant: Option<&Arc<QueryAuthGrant>>) -> Plan {
+        let has_row_filter = grant.is_some_and(|g| g.has_row_filter());
+        let plan = plan.stamp_query_auth_grant(grant.cloned());
+        if has_row_filter {
+            plan.with_inexact_row_counts()
+        } else {
+            plan
+        }
     }
 
     /// Fail closed for a `query-auth.enabled` table: scan planning — including
     /// `with_scan_all_files`, which read-facing system tables like `files` use —
     /// exposes file paths, row counts, and stats the client can't authorize.
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    /// Returns the fetched grant (`None` = not a query-auth table) so the caller
+    /// can widen the projection and stamp the splits with it.
+    async fn ensure_query_auth_allowed(&self) -> crate::Result<Option<Arc<QueryAuthGrant>>> {
+        // Fetch/refresh the grant at plan time (Java parity), then guard
+        // against pruning on masked or out-of-scope columns.
+        let select = self.query_auth_projected.as_ref().map(|projected| {
+            projected
+                .iter()
+                .copied()
+                .chain(self.query_auth_filter_columns.iter().copied())
+                .collect::<std::collections::HashSet<usize>>()
+        });
+        let grant = self
+            .table
+            .verify_query_auth_for_read(select.as_ref())
+            .await?;
+        if let Some(grant) = &grant {
+            crate::table::query_auth::scope_check(
+                grant,
+                self.table.schema().fields(),
+                &self.query_auth_filter_columns,
+                self.query_auth_projected.clone(),
+            )?;
+        }
+        Ok(grant)
     }
 
-    fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
-        Ok(self.projected_read_field_ids.clone())
+    /// The projected field ids for data-evolution column-slice pruning, widened
+    /// with the grant's row-filter / mask-input columns so pruning cannot drop a
+    /// file holding a column the grant needs (an omitted column would read as
+    /// null and wrongly satisfy `IS_NULL`). Computed here — with the grant in
+    /// hand — rather than at `new_scan` time, where the grant does not yet exist.
+    fn auth_widened_read_field_ids(&self, grant: Option<&QueryAuthGrant>) -> Option<HashSet<i32>> {
+        let mut ids = self.projected_read_field_ids.clone();
+        if let (Some(set), Some(grant)) = (ids.as_mut(), grant) {
+            set.extend(grant.read_field_ids(self.table.schema().fields()));
+        }
+        ids
     }
 
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
@@ -1006,8 +1097,16 @@ impl<'a> PaimonTableScan<'a> {
         Ok(merged)
     }
 
-    fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
+    fn can_push_down_limit_hint(
+        &self,
+        row_ranges: Option<&[RowRange]>,
+        query_auth_row_filter: bool,
+    ) -> bool {
+        // A query-auth row filter is applied as a residual pass at read time, so
+        // split merged_row_count overcounts; count-based limit pruning would drop
+        // splits holding later authorized rows.
         can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+            && !query_auth_row_filter
     }
 
     /// The predicate set that may prune WHOLE FILES by their stats.
@@ -1053,6 +1152,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: Snapshot,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
+        query_auth_row_filter: bool,
     ) -> crate::Result<Plan> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
@@ -1235,7 +1335,8 @@ impl<'a> PaimonTableScan<'a> {
             };
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
-        let can_push_down_limit = self.can_push_down_limit_hint(effective_row_ranges.as_deref());
+        let can_push_down_limit =
+            self.can_push_down_limit_hint(effective_row_ranges.as_deref(), query_auth_row_filter);
         let mut limit_accumulator = match self.limit {
             Some(limit) if limit > 0 && can_push_down_limit => {
                 Some(LimitPushdownAccumulator::new(limit))

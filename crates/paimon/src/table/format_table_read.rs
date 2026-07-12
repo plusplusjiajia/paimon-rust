@@ -21,7 +21,7 @@ use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
-use crate::spec::{extract_datum, BinaryRow, CoreOptions, DataField, DataType, Datum, Predicate};
+use crate::spec::{extract_datum, BinaryRow, DataField, DataType, Datum, Predicate};
 use crate::{DataSplit, Error};
 use arrow_array::{
     new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
@@ -68,6 +68,10 @@ impl<'a> FormatTableRead<'a> {
         self.table
     }
 
+    pub(crate) fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
     pub(crate) fn with_filter(mut self, filter: Predicate) -> Self {
         self.data_predicates = split_scan_predicates(self.table, filter).1;
         self
@@ -77,7 +81,8 @@ impl<'a> FormatTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Query-auth (fail-closed + row filter + masking) is enforced by the
+        // outer `TableRead::to_arrow` off the grant stamped on the splits.
         let read_type = self.read_type.clone();
         let output_schema = build_target_arrow_schema(&read_type)?;
         let partition_keys = self.table.schema().partition_keys().to_vec();

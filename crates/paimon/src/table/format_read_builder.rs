@@ -21,9 +21,10 @@ use super::partition_filter::PartitionFilter;
 use super::read_builder::resolve_projected_fields;
 use super::read_builder::split_scan_predicates;
 use super::{Table, TableRead, TableScan};
-use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::Result;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FormatReadBuilder<'a> {
@@ -32,6 +33,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
     limit: Option<usize>,
+    filter_columns: HashSet<usize>,
 }
 
 impl<'a> FormatReadBuilder<'a> {
@@ -42,6 +44,7 @@ impl<'a> FormatReadBuilder<'a> {
             partition_filter: None,
             data_predicates: Vec::new(),
             limit: None,
+            filter_columns: HashSet::new(),
         }
     }
 
@@ -61,6 +64,10 @@ impl<'a> FormatReadBuilder<'a> {
     }
 
     pub(crate) fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        // Capture the full predicate's columns before it is split, so masked and
+        // out-of-scope partition keys can't prune on their raw value.
+        self.filter_columns.clear();
+        filter.collect_leaf_field_indices(&mut self.filter_columns);
         let (partition_predicate, data_predicates) = split_scan_predicates(self.table, filter);
         self.partition_filter = partition_predicate.map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
@@ -91,10 +98,29 @@ impl<'a> FormatReadBuilder<'a> {
             self.limit,
             None,
         )
+        .with_query_auth_scope(self.filter_columns.clone(), self.projected_schema_indices())
+    }
+
+    /// Table-schema indices of the projected columns (`None` = all).
+    fn projected_schema_indices(&self) -> Option<Vec<usize>> {
+        self.read_type.as_ref().map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|s| s.id() == f.id())
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Query-auth is enforced in `TableRead::to_arrow` off the grant stamped
+        // on the splits by planning; no gate needed here (see the Paimon
+        // `PaimonReadBuilder::new_read`).
         let read_type = match &self.read_type {
             None => self.table.schema().fields().to_vec(),
             Some(fields) => fields.clone(),

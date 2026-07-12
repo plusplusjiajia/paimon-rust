@@ -119,7 +119,9 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -182,6 +184,13 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        // Strict, like the scored path: batch vector search reads index files
+        // raw (default fast mode never touches `plan`/`to_arrow`) and returns
+        // top-k membership, ordering, and similarity scores computed over
+        // masked/filter-hidden rows — a ranking oracle. It cannot enforce the
+        // row filter, so only a fully unrestricted grant may run it. Also covers
+        // the DataFusion lateral path, which calls this builder directly.
+        self.table.authorize_unrestricted_read().await?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1873,6 +1882,23 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "vector search must fail closed for a query-auth table"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_execute_fails_closed_when_query_auth_enabled() {
+        // The batch builder reads index files raw (never through plan/to_arrow),
+        // so it must gate query-auth itself — a top-k ranking oracle over
+        // masked/filter-hidden rows otherwise. Covers the DataFusion lateral path.
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "batch vector search must fail closed for a query-auth table"
         );
     }
 

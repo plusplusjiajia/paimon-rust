@@ -32,6 +32,8 @@ pub(crate) struct FormatTableScan<'a> {
     table: &'a Table,
     partition_filter: Option<PartitionFilter>,
     limit: Option<usize>,
+    query_auth_filter_columns: std::collections::HashSet<usize>,
+    query_auth_projected: Option<Vec<usize>>,
 }
 
 impl<'a> FormatTableScan<'a> {
@@ -44,26 +46,85 @@ impl<'a> FormatTableScan<'a> {
             table,
             partition_filter,
             limit,
+            query_auth_filter_columns: std::collections::HashSet::new(),
+            query_auth_projected: None,
         }
     }
 
+    pub(super) fn with_query_auth_scope(
+        mut self,
+        filter_columns: std::collections::HashSet<usize>,
+        projected: Option<Vec<usize>>,
+    ) -> Self {
+        self.query_auth_filter_columns = filter_columns;
+        self.query_auth_projected = projected;
+        self
+    }
+
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
-        self.plan_inner(None).await
+        let grant = self.ensure_query_auth_allowed().await?;
+        let has_row_filter = grant.as_deref().is_some_and(|g| g.has_row_filter());
+        self.plan_inner(None, has_row_filter)
+            .await
+            .map(|plan| self.finalize_plan(plan, grant.as_ref()))
     }
 
     pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
+        let grant = self.ensure_query_auth_allowed().await?;
+        let has_row_filter = grant.as_deref().is_some_and(|g| g.has_row_filter());
         let mut trace = ScanTrace::default();
-        let plan = self.plan_inner(Some(&mut trace)).await?;
-        Ok((plan, trace))
+        let plan = self.plan_inner(Some(&mut trace), has_row_filter).await?;
+        Ok((self.finalize_plan(plan, grant.as_ref()), trace))
     }
 
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    /// Stamp the grant onto every split (so `TableRead::to_arrow` enforces it)
+    /// and mark row counts inexact when it carries a row filter.
+    fn finalize_plan(
+        &self,
+        plan: Plan,
+        grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
+    ) -> Plan {
+        let has_row_filter = grant.is_some_and(|g| g.has_row_filter());
+        let plan = plan.stamp_query_auth_grant(grant.cloned());
+        if has_row_filter {
+            plan.with_inexact_row_counts()
+        } else {
+            plan
+        }
     }
 
-    async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {
+    async fn ensure_query_auth_allowed(
+        &self,
+    ) -> crate::Result<Option<std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>> {
+        // Fetch/refresh the grant at plan time (Java parity), then guard
+        // against pruning on masked or out-of-scope columns.
+        let select = self.query_auth_projected.as_ref().map(|projected| {
+            projected
+                .iter()
+                .copied()
+                .chain(self.query_auth_filter_columns.iter().copied())
+                .collect::<std::collections::HashSet<usize>>()
+        });
+        let grant = self
+            .table
+            .verify_query_auth_for_read(select.as_ref())
+            .await?;
+        if let Some(grant) = &grant {
+            crate::table::query_auth::scope_check(
+                grant,
+                self.table.schema().fields(),
+                &self.query_auth_filter_columns,
+                self.query_auth_projected.clone(),
+            )?;
+        }
+        Ok(grant)
+    }
+
+    async fn plan_inner(
+        &self,
+        trace: Option<&mut ScanTrace>,
+        query_auth_row_filter: bool,
+    ) -> crate::Result<Plan> {
         let core_options = CoreOptions::new(self.table.schema().options());
         let format_extension = supported_format_table_extension(core_options.file_format())?;
         let schema_id = self.table.schema().id();
@@ -103,7 +164,7 @@ impl<'a> FormatTableScan<'a> {
                     .cmp(&right.data_files()[0].file_name)
             })
         });
-        splits = self.apply_limit_pushdown(splits);
+        splits = self.apply_limit_pushdown(splits, query_auth_row_filter);
 
         if let Some(trace) = trace {
             trace.record_final_plan(splits.len(), splits.len(), splits.len());
@@ -275,7 +336,13 @@ impl<'a> FormatTableScan<'a> {
     pub(crate) fn apply_limit_pushdown(
         &self,
         splits: Vec<crate::DataSplit>,
+        query_auth_row_filter: bool,
     ) -> Vec<crate::DataSplit> {
+        // A query-auth row filter runs as a residual pass at read time, so the
+        // scan must not cap files by an unfiltered limit before that.
+        if query_auth_row_filter {
+            return splits;
+        }
         match self.limit {
             Some(0) => Vec::new(),
             Some(limit) if splits.len() > limit => splits.into_iter().take(limit).collect(),

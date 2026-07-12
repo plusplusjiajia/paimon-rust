@@ -20,8 +20,10 @@
 //! Reference: [org.apache.paimon.table.source](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/).
 
 use crate::spec::{BinaryRow, DataFileMeta};
+use crate::table::query_auth::QueryAuthGrant;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 fn is_vector_store_file_name(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().contains(".vector.")
@@ -487,6 +489,13 @@ pub struct DataSplit {
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
     raw_convertible: bool,
+    /// The per-user query-auth grant this split must be read under, stamped by
+    /// scan planning (or a write-path authorizer). Runtime-only — never
+    /// serialized — mirroring Java `QueryAuthSplit(split, authResult)`. Carried
+    /// on the split so `TableRead::to_arrow` enforces the exact grant the plan
+    /// fetched, instead of a shared mutable slot on `Table`.
+    #[serde(skip)]
+    query_auth_grant: Option<Arc<QueryAuthGrant>>,
 }
 
 impl DataSplit {
@@ -523,6 +532,18 @@ impl DataSplit {
     /// field doc. Mirrors Java `DataSplit#rawConvertible`.
     pub fn raw_convertible(&self) -> bool {
         self.raw_convertible
+    }
+
+    /// The query-auth grant this split is read under, if any (see the field doc).
+    pub(crate) fn query_auth_grant(&self) -> Option<&Arc<QueryAuthGrant>> {
+        self.query_auth_grant.as_ref()
+    }
+
+    /// Stamp the query-auth grant this split must be read under. Called by scan
+    /// planning and write-path authorizers on every emitted split.
+    pub(crate) fn with_query_auth_grant(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
+        self.query_auth_grant = grant;
+        self
     }
 
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
@@ -908,6 +929,7 @@ impl DataSplitBuilder {
             data_deletion_files: self.data_deletion_files,
             row_ranges: self.row_ranges,
             raw_convertible: self.raw_convertible,
+            query_auth_grant: None,
         })
     }
 }
@@ -926,14 +948,44 @@ impl Default for DataSplitBuilder {
 #[derive(Debug)]
 pub struct Plan {
     splits: Vec<DataSplit>,
+    /// False when a residual pass (e.g. a query-auth row filter) drops rows
+    /// after the scan, so split row counts overcount the read output.
+    row_counts_exact: bool,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self { splits }
+        Self {
+            splits,
+            row_counts_exact: true,
+        }
+    }
+    pub(crate) fn with_inexact_row_counts(mut self) -> Self {
+        self.row_counts_exact = false;
+        self
+    }
+
+    /// Stamp the per-user query-auth grant onto every split so
+    /// [`crate::table::TableRead::to_arrow`] enforces exactly the grant this
+    /// plan fetched (see [`DataSplit::with_query_auth_grant`]). A no-op when
+    /// `grant` is `None` (non-query-auth table): splits keep their empty grant
+    /// and read raw.
+    pub(crate) fn stamp_query_auth_grant(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
+        if grant.is_some() {
+            self.splits = self
+                .splits
+                .into_iter()
+                .map(|s| s.with_query_auth_grant(grant.clone()))
+                .collect();
+        }
+        self
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+    /// Whether split row counts exactly reflect the rows a read will produce.
+    pub fn row_counts_exact(&self) -> bool {
+        self.row_counts_exact
     }
 }
 

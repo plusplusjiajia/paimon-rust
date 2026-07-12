@@ -167,6 +167,21 @@ impl AlterTableRequest {
     }
 }
 
+/// Request for auth table query: the projected columns of the query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthTableQueryRequest {
+    /// Projected column names; `None` means all columns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<Vec<String>>,
+}
+
+impl AuthTableQueryRequest {
+    /// Create a new AuthTableQueryRequest.
+    pub fn new(select: Option<Vec<String>>) -> Self {
+        Self { select }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +206,18 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"removals\":[\"old_key\"]"));
         assert!(json.contains("\"updates\""));
+    }
+
+    #[test]
+    fn test_auth_table_query_request_serialization() {
+        let req = AuthTableQueryRequest::new(Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"select":["a","b"]}"#
+        );
+        // `None` omits the key entirely (matches the server's optional field).
+        let req = AuthTableQueryRequest::new(None);
+        assert_eq!(serde_json::to_string(&req).unwrap(), "{}");
     }
 
     #[test]

@@ -31,16 +31,16 @@ mod api_response;
 
 // Re-export request types
 pub use api_request::{
-    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateFunctionRequest,
-    CreateTableRequest, CreateViewRequest, RenameTableRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
+    CreateFunctionRequest, CreateTableRequest, CreateViewRequest, RenameTableRequest,
 };
 
 // Re-export response types
 pub use api_response::{
-    AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse, GetFunctionResponse,
-    GetTableResponse, GetTableTokenResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse, ListViewsResponse,
-    PagedList,
+    AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetViewResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
+    ListViewsResponse, PagedList,
 };
 
 // Re-export error types

@@ -55,6 +55,7 @@ pub(crate) mod merge_tree_split_generator;
 mod partition_filter;
 mod postpone_file_writer;
 mod prepared_files;
+pub(crate) mod query_auth;
 mod read_builder;
 pub mod referenced_files;
 pub(crate) mod rest_env;
@@ -117,7 +118,9 @@ pub use write_builder::WriteBuilder;
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
-use std::collections::HashMap;
+use query_auth::QueryAuthGrant;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -162,6 +165,79 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
         }
+    }
+
+    /// Authorize this user against the REST server when `query-auth.enabled` is
+    /// set: fetch and parse the per-user row filter / column masking and return
+    /// it as the grant the read pipeline enforces. `select` are the queried
+    /// columns (table-schema indices; `None` = all) — like Java's
+    /// `readType.getFieldNames()`, so a column-restricted user can still read
+    /// an authorized subset; the grant is scoped to exactly those columns and a
+    /// wider read fails closed until it re-plans. Returns `None` when the table
+    /// is not `query-auth.enabled`. Called from scan planning and search
+    /// execution at the same per-plan frequency as Java's
+    /// `CatalogEnvironment.tableQueryAuth()`, so a revoked grant takes effect on
+    /// the next plan. The grant is threaded to the read on the split it plans
+    /// (never a shared mutable slot), so it is per-query and cannot leak into a
+    /// concurrent query or a write-path rewrite.
+    pub(crate) async fn verify_query_auth_for_read(
+        &self,
+        select: Option<&HashSet<usize>>,
+    ) -> Result<Option<Arc<QueryAuthGrant>>> {
+        if !CoreOptions::new(self.schema.options()).query_auth_enabled() {
+            return Ok(None);
+        }
+        let Some(rest_env) = &self.rest_env else {
+            return Err(crate::Error::Unsupported {
+                message: "reading a table with 'query-auth.enabled' = true requires a REST \
+                          catalog to authorize the query"
+                    .to_string(),
+            });
+        };
+        let fields = self.schema.fields();
+        let select_names = select.map(|indices| {
+            fields
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| indices.contains(i))
+                .map(|(_, f)| f.name().to_string())
+                .collect::<Vec<_>>()
+        });
+        let auth = rest_env.table_query_auth(select_names).await?;
+        let filters = query_auth::parse_auth_filters(&auth.filter.unwrap_or_default(), fields)?;
+        let masks =
+            query_auth::parse_column_masking(&auth.column_masking.unwrap_or_default(), fields)?;
+        Ok(Some(Arc::new(QueryAuthGrant::new(
+            filters,
+            masks,
+            select.cloned(),
+        ))))
+    }
+
+    /// Authorize a read that cannot enforce a row filter / masking on its output
+    /// (search, system tables, or a write-path rewrite that must read raw).
+    /// Returns the grant to stamp on the splits it reads (`None` = not a
+    /// query-auth table). Fails closed when the grant is restricted — such a
+    /// path must never run under a partial grant, since it would either leak
+    /// (search/metadata) or silently drop/mask rows into a committed rewrite.
+    pub(crate) async fn authorize_unrestricted_read(&self) -> Result<Option<Arc<QueryAuthGrant>>> {
+        match self.verify_query_auth_for_read(None).await? {
+            Some(grant) if grant.is_unrestricted() => Ok(Some(grant)),
+            Some(_) => {
+                // A restricted grant only arrives on a query-auth.enabled table,
+                // where the strict schema check always fails closed.
+                CoreOptions::new(self.schema.options()).ensure_read_authorized()?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fail closed when a read reaches `TableRead::to_arrow` without a grant
+    /// stamped on its splits (an unauthorized path) and the table is
+    /// `query-auth.enabled`; a no-op otherwise.
+    pub(crate) fn ensure_read_without_grant(&self) -> Result<()> {
+        CoreOptions::new(self.schema.options()).ensure_read_authorized()
     }
 
     /// Get the table's identifier.
@@ -456,4 +532,22 @@ pub(crate) fn query_auth_table() -> Table {
         table_schema,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_authorize_unrestricted_read_fails_closed() {
+        // Every write/build path (cow_writer, data_evolution_writer, btree index
+        // build, cross-partition bucket assign) authorizes through this gate
+        // before its internal read. A query-auth table it cannot authorize as
+        // unrestricted must fail closed rather than read raw and rewrite
+        // filtered/masked data into a committed result.
+        let table = super::query_auth_table();
+        let err = table.authorize_unrestricted_read().await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "write-path authorization must fail closed, got: {err}"
+        );
+    }
 }

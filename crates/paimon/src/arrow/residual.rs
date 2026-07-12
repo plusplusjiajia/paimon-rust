@@ -566,7 +566,7 @@ fn evaluate_set_membership_predicate(
     Ok(combined)
 }
 
-fn evaluate_column_predicate(
+pub(crate) fn evaluate_column_predicate(
     column: &ArrayRef,
     scalar: &Scalar<ArrayRef>,
     op: PredicateOperator,
@@ -726,7 +726,7 @@ fn combine_filter_masks(left: &BooleanArray, right: &BooleanArray, use_or: bool)
     })
 }
 
-fn boolean_mask_from_predicate(
+pub(crate) fn boolean_mask_from_predicate(
     len: usize,
     mut predicate: impl FnMut(usize) -> bool,
 ) -> BooleanArray {
