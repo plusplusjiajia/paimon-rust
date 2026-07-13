@@ -208,8 +208,16 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             return internal_err!("PaimonVariantExtractionScan physical planning expects no input");
         }
 
-        let filter_analysis = analyze_filters(&node.filters, node.table.schema().fields());
+        // Column-name matching is case-sensitive on the DataFusion path, mirroring
+        // `TableProvider::scan`: DataFusion resolves columns against the provider
+        // schema before this planner runs, so a genuine case mismatch fails at
+        // planning and never reaches here. Case-insensitive matching is offered
+        // only through the direct ReadBuilder API (core / C / Python), not via SQL.
+        let case_sensitive = true;
+        let filter_analysis =
+            analyze_filters(&node.filters, node.table.schema().fields(), case_sensitive);
         let mut read_builder = node.table.new_read_builder();
+        read_builder.with_case_sensitive(case_sensitive);
         read_builder.with_read_type(node.read_type.clone());
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
@@ -250,6 +258,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             filter_exact,
             Some(scan_trace),
             Some(node.pushed_variants.clone()),
+            case_sensitive,
         ))))
     }
 }
