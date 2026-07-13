@@ -427,9 +427,54 @@ pub struct GetTableTokenResponse {
     pub expires_at_millis: Option<i64>,
 }
 
+/// Response for auth table query: the per-user row filter and column masking the
+/// client must enforce at read time for a `query-auth.enabled` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthTableQueryResponse {
+    /// JSON-serialized row-filter predicates, ANDed together. Empty/None = no filter.
+    pub filter: Option<Vec<String>>,
+    /// column name -> JSON-serialized masking transform. Empty/None = no masking.
+    pub column_masking: Option<HashMap<String, String>>,
+}
+
+impl AuthTableQueryResponse {
+    /// True when the server imposes no row filter and no column masking.
+    pub fn is_unrestricted(&self) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.is_empty())
+            && self.column_masking.as_ref().is_none_or(|m| m.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_auth_table_query_response_deserialization() {
+        // A restricted grant: pin the exact wire field names. A drift in either
+        // (`filter` / `columnMasking`) would deserialize to None and silently
+        // skip authorization, so this test fails closed against that.
+        let resp: AuthTableQueryResponse =
+            serde_json::from_str(r#"{"filter":["p0","p1"],"columnMasking":{"ssn":"m0"}}"#).unwrap();
+        assert_eq!(resp.filter, Some(vec!["p0".to_string(), "p1".to_string()]));
+        assert_eq!(
+            resp.column_masking,
+            Some(HashMap::from([("ssn".to_string(), "m0".to_string())]))
+        );
+        assert!(!resp.is_unrestricted());
+
+        // The real server sends `{}` for an unrestricted grant (both fields are
+        // `@JsonInclude(NON_NULL)` in Java); it must parse to an empty grant.
+        let empty: AuthTableQueryResponse = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, AuthTableQueryResponse::default());
+        assert!(empty.is_unrestricted());
+
+        // Present-but-empty collections are also unrestricted.
+        let blank: AuthTableQueryResponse =
+            serde_json::from_str(r#"{"filter":[],"columnMasking":{}}"#).unwrap();
+        assert!(blank.is_unrestricted());
+    }
 
     #[test]
     fn test_error_response_serialization() {

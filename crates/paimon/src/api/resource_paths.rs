@@ -147,6 +147,11 @@ impl ResourcePaths {
         )
     }
 
+    /// Get the auth-table-query endpoint path (`.../tables/{table}/auth`).
+    pub fn auth_table(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/auth", self.table(database_name, table_name))
+    }
+
     /// Get the table details endpoint path.
     pub fn table_details(&self, database_name: &str) -> String {
         format!(
@@ -240,6 +245,15 @@ mod tests {
         let table_path = paths.table("my-db", "my-table");
         assert!(table_path.contains("my-db"));
         assert!(table_path.contains("my-table"));
+    }
+
+    #[test]
+    fn test_auth_table_path_encodes_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.auth_table("analytics db", "user events"),
+            "/v1/catalog/databases/analytics+db/tables/user+events/auth"
+        );
     }
 
     #[test]

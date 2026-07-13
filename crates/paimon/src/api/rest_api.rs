@@ -29,13 +29,13 @@ use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot
 use crate::Result;
 
 use super::api_request::{
-    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateFunctionRequest,
-    CreateTableRequest, CreateViewRequest, RenameTableRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
+    CreateFunctionRequest, CreateTableRequest, CreateViewRequest, RenameTableRequest,
 };
 use super::api_response::{
-    ConfigResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
-    ListViewsResponse, PagedList,
+    AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
+    GetTableResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
+    ListPartitionsResponse, ListTablesResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::resource_paths::ResourcePaths;
@@ -626,6 +626,21 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.table_token(database, table);
         self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    /// Fetch the per-user row filter and column masking for a `query-auth.enabled`
+    /// table. `select` is the query's projected columns (`None` = all columns).
+    pub async fn auth_table_query(
+        &self,
+        identifier: &Identifier,
+        select: Option<Vec<String>>,
+    ) -> Result<AuthTableQueryResponse> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.auth_table(database, table);
+        let request = AuthTableQueryRequest::new(select);
+        self.client.post(&path, &request).await
     }
 
     // ==================== Commit Operations ====================
