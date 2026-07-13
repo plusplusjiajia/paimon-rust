@@ -54,6 +54,7 @@ mod kv_file_writer;
 mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
 mod partition_filter;
+mod partition_stat;
 mod postpone_file_writer;
 mod prepared_files;
 mod read_builder;
@@ -100,6 +101,7 @@ pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
+pub use partition_stat::PartitionStat;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
