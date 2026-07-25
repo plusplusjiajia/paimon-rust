@@ -606,11 +606,9 @@ impl fmt::Display for Predicate {
 // ---------------------------------------------------------------------------
 
 impl Predicate {
-    /// Parse a `Predicate` from the REST catalog wire format (the JSON the
-    /// server serializes with the Java reference impl, see Java
-    /// `LeafPredicate`/`CompoundPredicate`). Field references resolve by name
-    /// against `fields`, whose types drive literal conversion. Only `FIELD_REF`
-    /// transforms are supported; anything unknown errors (fail-closed).
+    /// Parse a `Predicate` from the REST catalog wire format (Java
+    /// `LeafPredicate`/`CompoundPredicate` JSON). Fields resolve by name against
+    /// `fields`; anything unknown errors (fail-closed).
     pub fn from_rest_json(json: &str, fields: &[DataField]) -> Result<Predicate> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(rest_json_err)?;
         let builder = PredicateBuilder::new(fields);
@@ -679,15 +677,33 @@ fn parse_rest_leaf(
     builder: &PredicateBuilder,
     fields: &[DataField],
 ) -> Result<Predicate> {
-    // Non-FIELD_REF transforms (CAST, CONCAT, ...) cannot be evaluated here.
+    // Java requires a well-formed transform on every leaf (`fromJson` calls
+    // `transform.outputType()`), so resolve it before anything else — accepting
+    // a malformed leaf as AlwaysTrue would turn it into allow-all.
     let transform = value
         .get("transform")
         .ok_or_else(|| rest_json_err("LEAF without transform"))?;
-    if str_prop(transform, "name")? != "FIELD_REF" {
-        return Err(rest_json_err(format!(
-            "transform `{}`",
-            str_prop(transform, "name")?
-        )));
+    let transform_name = str_prop(transform, "name")?;
+
+    // AlwaysTrue/AlwaysFalse: Java builds them with the NULL transform
+    // (`PredicateBuilder::alwaysTrue`), so the function decides and no field is
+    // resolved. Any other transform with these functions fails closed.
+    if let function @ ("TRUE" | "FALSE") = str_prop(value, "function")? {
+        if transform_name != "NULL" {
+            return Err(rest_json_err(format!(
+                "{function} with transform `{transform_name}`"
+            )));
+        }
+        return Ok(if function == "TRUE" {
+            Predicate::AlwaysTrue
+        } else {
+            Predicate::AlwaysFalse
+        });
+    }
+
+    // Non-FIELD_REF transforms (CAST, CONCAT, ...) cannot be evaluated here.
+    if transform_name != "FIELD_REF" {
+        return Err(rest_json_err(format!("transform `{transform_name}`")));
     }
     let field = transform
         .get("fieldRef")
@@ -702,9 +718,8 @@ fn parse_rest_leaf(
         .ok_or_else(|| rest_json_err(format!("unknown field `{field}`")))?;
 
     let function = str_prop(value, "function")?;
-    // Convert EVERY literal up front (Java `deserializeLiterals` validates all
-    // elements), so a malformed extra literal fails the whole parse instead of
-    // being silently dropped. A JSON null is `None` (SQL NULL).
+    // Convert every literal up front (like Java `deserializeLiterals`) so a
+    // malformed extra literal fails the parse. JSON null -> `None` (SQL NULL).
     let literals: Vec<Option<Datum>> = value
         .get("literals")
         .and_then(serde_json::Value::as_array)
@@ -790,10 +805,8 @@ fn parse_rest_leaf(
     }
 }
 
-/// Reject LIKE escapes Java `Like.sqlToRegexLike` rejects (`\` must precede
-/// `_`, `%`, or `\` and can't be trailing) — Java throws there, failing the
-/// read closed, so we do too. Valid `_`/`%`/escapes are evaluated with Java
-/// semantics by the authorization evaluator.
+/// Reject the LIKE escapes Java `Like.sqlToRegexLike` rejects (`\` must precede
+/// `_`, `%`, or `\` and can't be trailing).
 fn validate_rest_like_escapes(pattern: &str) -> Result<()> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;
@@ -829,9 +842,8 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
         DataType::SmallInt(_) => int_datum(value, |v| i16::try_from(v).ok().map(Datum::SmallInt)),
         DataType::Int(_) => int_datum(value, |v| i32::try_from(v).ok().map(Datum::Int)),
         DataType::BigInt(_) => int_datum(value, |v| Some(Datum::Long(v))),
-        // An integral FLOAT form is narrowed directly (Java calls
-        // `Long.floatValue()`, a single rounding; going through f64 would round
-        // twice). The Java-semantic evaluator distinguishes -0.0/+0.0.
+        // Integral FLOAT forms narrow directly (Java `Long.floatValue()`, one
+        // rounding); going through f64 would round twice.
         DataType::Float(_) => {
             let narrowed = if let Some(i) = value.as_i64() {
                 Some(i as f32)
@@ -848,7 +860,7 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
             .map(|s| Datum::String(s.to_string()))
             .ok_or_else(type_err),
         // Temporal/decimal literals fail closed: Java's own JSON deserializer
-        // cannot round-trip them, so there is no wire form to align with.
+        // cannot round-trip them.
         other => Err(rest_json_err(format!(
             "literal conversion for type {other:?} is not supported"
         ))),
@@ -892,9 +904,9 @@ pub enum TransformInput {
 }
 
 impl Transform {
-    /// Parse a `Transform` from the REST catalog wire format (the JSON the
-    /// server serializes with the Java reference impl). Field references resolve
-    /// by name against `fields`; anything unknown errors (fail-closed).
+    /// Parse a `Transform` from the REST catalog wire format (Java `Transform`
+    /// JSON). Fields resolve by name against `fields`; anything unknown errors
+    /// (fail-closed).
     pub fn from_rest_json(json: &str, fields: &[DataField]) -> Result<Transform> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(rest_json_err)?;
         parse_rest_transform(&value, fields)
@@ -3056,6 +3068,19 @@ mod tests {
             }
         ));
 
+        // AlwaysTrue/AlwaysFalse: LEAF with a placeholder NULL transform.
+        let json = r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"TRUE","literals":[]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(parsed, Predicate::AlwaysTrue));
+        let json =
+            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"FALSE","literals":[]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(parsed, Predicate::AlwaysFalse));
+        // ... and as a COMPOUND child, absorbed: AND(FALSE, x) -> AlwaysFalse.
+        let json = r#"{"kind":"COMPOUND","function":"AND","children":[{"kind":"LEAF","transform":{"name":"NULL"},"function":"FALSE","literals":[]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]}]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(&parsed, Predicate::AlwaysFalse));
+
         // Nested COMPOUND(OR).
         let json = r#"{"kind":"COMPOUND","function":"OR","children":[{"kind":"COMPOUND","function":"OR","children":[{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[2]}]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[3]}]}"#;
         assert!(matches!(
@@ -3130,9 +3155,8 @@ mod tests {
         }
     }
 
-    /// Null-literal semantics mirror the Java evaluators: LeafBinaryFunction /
-    /// LeafTernaryFunction test false on a null literal, In skips nulls, NotIn
-    /// fails every row on a null and keeps non-null rows for an empty list.
+    /// Null-literal semantics mirror the Java evaluators (binary/ternary test
+    /// false on null; In skips nulls; NotIn fails every row on null).
     #[test]
     fn test_from_rest_json_null_literal_semantics() {
         let fields = test_fields();
@@ -3191,8 +3215,7 @@ mod tests {
                 "invalid LIKE escape must be rejected: {json}"
             );
         }
-        // Valid patterns (incl. unescaped `_`, now evaluated with Java
-        // semantics) parse.
+        // Valid patterns (incl. unescaped `_`) parse.
         for pattern in ["a\\%b", "a\\_b", "a\\\\b", "%abc_", "a_b"] {
             let json = rest_leaf_json("LIKE", "name", &format!("[{pattern:?}]"));
             assert!(
@@ -3209,8 +3232,7 @@ mod tests {
             "f".to_string(),
             DataType::Double(crate::spec::DoubleType::new()),
         )];
-        // Zero literals and `<` on floats now parse (the Java-semantic
-        // evaluator distinguishes -0.0/+0.0 and NaN ordering).
+        // Zero literals and `<` on floats parse.
         for json in [
             rest_leaf_json_typed("EQUAL", "f", "DOUBLE", "[0.0]"),
             rest_leaf_json_typed("EQUAL", "f", "DOUBLE", "[-0.0]"),
@@ -3272,7 +3294,13 @@ mod tests {
             // Non-FIELD_REF transforms (verbatim shapes from Java serde tests).
             r#"{"kind":"LEAF","transform":{"name":"UPPER","inputs":[{"index":1,"name":"name","type":"STRING"}]},"function":"STARTS_WITH","literals":["A"]}"#.to_string(),
             r#"{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"id","type":"INT"},"type":"BIGINT"},"function":"GREATER_THAN","literals":[10]}"#.to_string(),
-            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"TRUE","literals":[]}"#.to_string(),
+            // NULL transform with a field function (TRUE/FALSE is accepted).
+            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"EQUAL","literals":[5]}"#.to_string(),
+            // A constant leaf must still carry a well-formed NULL transform;
+            // accepting a malformed one as TRUE would be allow-all.
+            r#"{"kind":"LEAF","function":"TRUE","literals":[]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"BOGUS"},"function":"TRUE","literals":[]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"INT"}},"function":"TRUE","literals":[]}"#.to_string(),
             r#"{"kind":"LEAF","transform":{"name":"LOWER","inputs":[{"index":2,"name":"f2","type":"STRING"}]},"function":"STARTS_WITH","literals":["abc"]}"#.to_string(),
             r#"{"kind":"LEAF","transform":{"name":"CONCAT_WS","inputs":["|",{"index":1,"name":"f1","type":"STRING"},"X",null,{"index":2,"name":"f2","type":"STRING"}]},"function":"ENDS_WITH","literals":["z"]}"#.to_string(),
             // Unknown kind, malformed JSON, type-mismatched literal.
