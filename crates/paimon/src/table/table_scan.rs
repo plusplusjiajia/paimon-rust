@@ -1185,7 +1185,18 @@ impl<'a> PaimonTableScan<'a> {
     ///
     /// This replaces any existing row_ranges. Typically used to inject
     /// results from global index lookups (e.g. full-text search).
+    /// Slicing by physical row id selects rows by `_ROW_ID` with no predicate,
+    /// so it must reach the auth request even when set after `new_scan` fixed
+    /// the scope (`ReadBuilder::with_row_ranges` does the same on its side).
     pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        let row_id = crate::spec::ROW_ID_FIELD_NAME.to_string();
+        // Only while ranges actually apply: clearing them must not leave a
+        // stale system-column request that could get an otherwise valid read
+        // rejected.
+        self.query_auth_system_select.retain(|n| n != &row_id);
+        if !ranges.is_empty() {
+            self.query_auth_system_select.push(row_id);
+        }
         self.row_ranges = if ranges.is_empty() {
             None
         } else {
@@ -1235,6 +1246,36 @@ impl<'a> PaimonTableScan<'a> {
     /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
+    /// Fail closed when the snapshot the plan will read was written under a
+    /// different schema than the grant was parsed against.
+    ///
+    /// The grant is fetched before the snapshot is resolved, so a schema-changing
+    /// commit landing in between would leave the rules bound to this copy's
+    /// schema while the plan consumes the new one — a drop-and-re-add in that
+    /// window binds them to unrelated field ids.
+    fn ensure_grant_matches_snapshot(
+        &self,
+        grant: Option<&Arc<QueryAuthGrant>>,
+        snapshot: &Snapshot,
+    ) -> crate::Result<()> {
+        let Some(grant) = grant else {
+            return Ok(());
+        };
+        // Only a snapshot NEWER than this copy is a problem. A schema-only ALTER
+        // writes `schema-N` without committing a snapshot, so the table schema
+        // is routinely ahead of the latest data snapshot — the reader evolves
+        // those older files by field id, and the rules were parsed against the
+        // newer schema they are expressed in.
+        if !grant.has_server_restrictions() || snapshot.schema_id() <= self.table.schema().id() {
+            return Ok(());
+        }
+        Err(crate::Error::Unsupported {
+            message: "the snapshot being planned was written under a newer schema than the \
+                      query-auth grant was issued for; re-plan the scan"
+                .to_string(),
+        })
+    }
+
     pub async fn plan(&self) -> crate::Result<Plan> {
         let grant = self.ensure_query_auth_allowed().await?;
         let has_row_filter = grant.as_deref().is_some_and(|g| g.has_row_filter());
@@ -1243,6 +1284,7 @@ impl<'a> PaimonTableScan<'a> {
             Some(snapshot) => snapshot,
             None => return Ok(self.finalize_plan(Plan::new(Vec::new()), grant.as_ref())),
         };
+        self.ensure_grant_matches_snapshot(grant.as_ref(), &snapshot)?;
         self.plan_snapshot(
             snapshot,
             data_evolution_read_field_ids.as_ref(),
@@ -1271,6 +1313,7 @@ impl<'a> PaimonTableScan<'a> {
                 ))
             }
         };
+        self.ensure_grant_matches_snapshot(grant.as_ref(), &snapshot)?;
         trace.snapshot_id = Some(snapshot.id());
         let plan = self
             .plan_snapshot(
@@ -1287,10 +1330,9 @@ impl<'a> PaimonTableScan<'a> {
     /// exactly this plan's grant) and mark row counts inexact when it carries a
     /// row filter (dropped as a residual pass inside `TableRead`).
     fn finalize_plan(&self, plan: Plan, grant: Option<&Arc<QueryAuthGrant>>) -> Plan {
-        // Any restricted grant invalidates the plan's statistics: a row filter
-        // drops rows, and masking rewrites column values (a NULL mask makes the
-        // column entirely null), so a statistics-only `COUNT` would report raw
-        // counts and bypass enforcement.
+        // A row filter drops rows and masking rewrites values, so a
+        // statistics-only `COUNT` would report raw counts and bypass
+        // enforcement.
         let restricted = grant.is_some_and(|g| g.has_server_restrictions());
         let plan = plan.stamp_query_auth_grant(grant.cloned());
         if restricted {
@@ -1317,9 +1359,21 @@ impl<'a> PaimonTableScan<'a> {
         });
         let grant = self
             .table
-            .verify_query_auth_for_read(select.as_ref(), &self.query_auth_system_select)
+            .verify_query_auth_for_read(select.as_ref(), Some(&self.query_auth_system_select))
             .await?;
         if let Some(grant) = &grant {
+            // `scan_all_files` returns the un-merged files a normal PK scan
+            // hides, whose paths and statistics precede the filtering that only
+            // runs in `TableRead`. A pure column scope distorts none of that and
+            // stays allowed (the cross-partition bucket assigner needs it).
+            if self.scan_all_files && grant.has_server_restrictions() {
+                return Err(crate::Error::Unsupported {
+                    message: "a query-auth row filter / column masking grant cannot be applied \
+                              to a scan-all-files plan: it returns raw physical files whose \
+                              paths and statistics precede enforcement"
+                        .to_string(),
+                });
+            }
             crate::table::query_auth::scope_check(
                 grant,
                 self.table.schema().fields(),
@@ -1330,11 +1384,10 @@ impl<'a> PaimonTableScan<'a> {
         Ok(grant)
     }
 
-    /// The projected field ids for data-evolution column-slice pruning, widened
-    /// with the grant's row-filter / mask-input columns so pruning cannot drop a
-    /// file holding a column the grant needs (an omitted column would read as
-    /// null and wrongly satisfy `IS_NULL`). Computed here — with the grant in
-    /// hand — rather than at `new_scan` time, where the grant does not yet exist.
+    /// Projected field ids for data-evolution column-slice pruning, widened with
+    /// the grant's filter / mask-input columns so pruning cannot drop a file
+    /// holding one (an omitted column reads as null and wrongly satisfies
+    /// `IS_NULL`). Needs the grant, so it cannot happen at `new_scan` time.
     fn auth_widened_read_field_ids(&self, grant: Option<&QueryAuthGrant>) -> Option<HashSet<i32>> {
         let mut ids = self.projected_read_field_ids.clone();
         if let (Some(set), Some(grant)) = (ids.as_mut(), grant) {

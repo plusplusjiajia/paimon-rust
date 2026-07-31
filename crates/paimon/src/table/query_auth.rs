@@ -21,8 +21,8 @@
 //! error, so callers keep the table fail-closed.
 
 use crate::arrow::residual::{
-    boolean_mask_from_predicate, evaluate_column_predicate, literal_scalar_for_arrow_filter,
-    sanitize_filter_mask,
+    boolean_mask_from_predicate, evaluate_column_predicate, evaluate_decimal_leaf,
+    literal_scalar_for_arrow_filter, sanitize_filter_mask,
 };
 use crate::spec::{
     DataField, DataType, Datum, Predicate, PredicateOperator, Transform, TransformInput,
@@ -33,15 +33,23 @@ use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, RecordBatc
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Row filters and column masks the REST server granted the current user for a
-/// specific set of columns. `authorized = None` means all columns were approved
-/// (the request used `select = all`); `Some(set)` scopes the grant to those
+/// Row filters and column masks the REST server granted this user.
+/// `authorized = None` means all columns; `Some(set)` scopes the grant to those
 /// table-schema indices. Only the REST catalog constructs grants.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct QueryAuthGrant {
     filters: Vec<Predicate>,
     masks: Vec<ColumnMask>,
     authorized: Option<HashSet<usize>>,
+    /// System fields the request asked about (`_ROW_ID`, …). They have no table
+    /// index, so `authorized` cannot hold them.
+    ///
+    /// `Some(set)` approves exactly `set` — an empty set approves none, so a
+    /// full projection is not blanket approval for `_ROW_ID`. `None` means
+    /// system scoping does not apply: internal raw reads (index builds, write
+    /// rewrites) authorize through `authorize_unrestricted_read`, run only when
+    /// the server imposed no rules at all, and legitimately read `_ROW_ID`.
+    authorized_system: Option<HashSet<String>>,
     /// Where this grant's positional indices are meaningful. The schema id
     /// alone would not do: it is a per-table counter, so two fresh tables
     /// both sit at 0.
@@ -51,6 +59,11 @@ pub(crate) struct QueryAuthGrant {
 /// Identity a grant is bound to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GrantBinding {
+    /// REST table UUID when available: an identifier or schema id can be reused
+    /// across catalogs or a drop/recreate, a UUID cannot.
+    uuid: Option<String>,
+    /// Catalog identity: two REST aliases can share a location.
+    identifier: String,
     location: String,
     branch: String,
     schema_id: i64,
@@ -59,6 +72,8 @@ pub(crate) struct GrantBinding {
 impl GrantBinding {
     pub(crate) fn of(table: &super::Table) -> Self {
         Self {
+            uuid: table.rest_env().map(|e| e.uuid().to_string()),
+            identifier: table.identifier().full_name(),
             location: table.location().to_string(),
             branch: table.branch().to_string(),
             schema_id: table.schema().id(),
@@ -72,14 +87,49 @@ impl QueryAuthGrant {
         filters: Vec<Predicate>,
         masks: Vec<ColumnMask>,
         authorized: Option<HashSet<usize>>,
+        authorized_system: Option<HashSet<String>>,
         binding: GrantBinding,
     ) -> Self {
         Self {
             filters,
             masks,
             authorized,
+            authorized_system,
             binding,
         }
+    }
+
+    /// Like [`Self::check_system_scope`], for system fields a read path adds on
+    /// top of its read type (the audit schema's `rowkind`).
+    pub(crate) fn check_system_scope_by_name(&self, names: &[&str]) -> Result<()> {
+        let Some(approved) = &self.authorized_system else {
+            return Ok(());
+        };
+        for name in names {
+            if !approved.contains(*name) {
+                return Err(unsupported(format!(
+                    "query-auth read emits system column `{name}` outside the authorized set"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail closed when `read_type` projects a system field outside this grant's
+    /// scope. Scoped by name: system fields have no table index.
+    pub(crate) fn check_system_scope(&self, read_type: &[DataField]) -> Result<()> {
+        let Some(approved) = &self.authorized_system else {
+            return Ok(());
+        };
+        for field in read_type.iter().filter(|f| is_reserved_system_field(f)) {
+            if !approved.contains(field.name()) {
+                return Err(unsupported(format!(
+                    "query-auth read projects system column `{}` outside the authorized set",
+                    field.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Whether this grant may be enforced on `table`.
@@ -92,10 +142,9 @@ impl QueryAuthGrant {
         self.authorized.is_none() && self.filters.is_empty() && self.masks.is_empty()
     }
 
-    /// Whether the SERVER restricted this user (a row filter or a column mask),
-    /// as opposed to the client merely scoping its own projection. Statistics
-    /// suppression, split transport and the incremental-read gate key off this:
-    /// a column-scoped grant with no filter and no mask distorts nothing.
+    /// Whether the SERVER restricted this user, as opposed to the client merely
+    /// scoping its own projection. Statistics suppression and the historical /
+    /// scan-all gates key off this: a column scope distorts nothing.
     pub(crate) fn has_server_restrictions(&self) -> bool {
         !self.filters.is_empty() || !self.masks.is_empty()
     }
@@ -141,10 +190,9 @@ impl QueryAuthGrant {
         columns.into_iter().find(|c| !self.authorizes_columns([*c]))
     }
 
-    /// Field IDs the grant must physically read (row-filter columns, mask
-    /// targets, and mask inputs). Scan projection planning must include these so
-    /// data-evolution column-slice pruning does not drop files that hold them
-    /// (an omitted column would read as null and wrongly satisfy `IS_NULL`).
+    /// Field IDs the grant must physically read (filter columns, mask targets
+    /// and inputs). Projection planning must include them, or column-slice
+    /// pruning drops the file and the column reads as null.
     pub(crate) fn read_field_ids(&self, fields: &[DataField]) -> Vec<i32> {
         let mut indices = HashSet::new();
         for filter in &self.filters {
@@ -194,9 +242,8 @@ pub(crate) fn unauthorized_column_error(fields: &[DataField], column: usize) -> 
 }
 
 /// Reserved system fields a read type may project. The reader produces them, so
-/// they are not table columns and carry no grant scope. Both id and name must
-/// match, so a forged field cannot borrow a system id. Mirrors Java
-/// `SpecialFields.SYSTEM_FIELD_NAMES`.
+/// they carry no grant scope. Both id and name must match, so a forged field
+/// cannot borrow a system id. Mirrors Java `SpecialFields.SYSTEM_FIELD_NAMES`.
 const RESERVED_SYSTEM_FIELDS: [(i32, &str); 4] = [
     (crate::spec::ROW_ID_FIELD_ID, crate::spec::ROW_ID_FIELD_NAME),
     (
@@ -213,6 +260,10 @@ const RESERVED_SYSTEM_FIELDS: [(i32, &str); 4] = [
     ),
 ];
 
+pub(crate) fn is_reserved_system_field_name(name: &str) -> bool {
+    RESERVED_SYSTEM_FIELDS.iter().any(|(_, n)| *n == name)
+}
+
 pub(crate) fn is_reserved_system_field(field: &DataField) -> bool {
     RESERVED_SYSTEM_FIELDS
         .iter()
@@ -222,10 +273,9 @@ pub(crate) fn is_reserved_system_field(field: &DataField) -> bool {
 /// Table-schema indices a read type touches, rejecting any field that is not a
 /// canonical `(id, name)` pair of `fields`.
 ///
-/// Scoping and masking resolve by id while the physical read resolves by name,
-/// so a read type pairing an authorized id with another column's name would be
-/// scoped by id and read by name. `TableRead::new` / `with_read_type` are
-/// public, so this is reachable — fail closed.
+/// Scoping resolves by id while the physical read resolves by name, so an
+/// authorized id under another column's name would be scoped by one and read as
+/// the other. `TableRead::new` is public, so this is reachable.
 pub(crate) fn canonical_projection(
     fields: &[DataField],
     read_type: &[DataField],
@@ -236,10 +286,9 @@ pub(crate) fn canonical_projection(
         let by_name = fields.iter().position(|s| s.name() == field.name());
         match (by_id, by_name) {
             (Some(i), Some(n)) if i == n => indices.push(i),
-            // Absent from the schema. Anything but a reserved system field is
-            // a column dropped by schema evolution, which the reader still
-            // resolves by field id in older files and returns raw. Java rejects
-            // it in `TableQueryAuthResult.checkFieldExists`.
+            // Absent from the schema. Anything but a system field is a dropped
+            // column, which the reader still resolves by id in older files.
+            // Java rejects it in `TableQueryAuthResult.checkFieldExists`.
             (None, None) if is_reserved_system_field(field) => {}
             _ => {
                 return Err(unsupported(format!(
@@ -253,10 +302,78 @@ pub(crate) fn canonical_projection(
     Ok(indices)
 }
 
-/// Live query-auth scope check shared by the read/scan gates: fail closed when
-/// the caller filter references a masked column (pruning on its raw value would
-/// leak it) or when the projection/filter touches a column outside the grant's
-/// authorized scope. `projected = None` means all columns.
+/// Names of the reserved system fields a read projects, plus any the caller's
+/// filter references. Shared by the Paimon and Format read builders, which
+/// otherwise kept two copies of this and drifted apart.
+///
+/// `filter_system_names` must be captured before row-id extraction rewrites the
+/// predicates, and `slices_by_row_id` covers an explicit row-range slice, which
+/// selects by `_ROW_ID` with no predicate at all.
+pub(crate) fn projected_system_field_names(
+    read_type: Option<&[DataField]>,
+    filter_system_names: &HashSet<String>,
+    slices_by_row_id: bool,
+) -> Vec<String> {
+    let mut names: HashSet<String> = read_type
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|f| is_reserved_system_field(f))
+                .map(|f| f.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.extend(filter_system_names.iter().cloned());
+    if slices_by_row_id {
+        names.insert(crate::spec::ROW_ID_FIELD_NAME.to_string());
+    }
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names
+}
+
+/// Everything a read must satisfy to run under `grant`, in one place.
+///
+/// Every read-side gate calls exactly this, so a check cannot be added to one
+/// gate and forgotten in another — the failure mode this module kept hitting.
+/// Returns the read type's table-schema indices, which callers need anyway.
+///
+/// `implicit_system_fields` are system columns the path emits on top of
+/// `read_type` (the audit schema prepends `rowkind`), which therefore never
+/// reached the projection or the auth request.
+pub(crate) fn authorize_read(
+    grant: &QueryAuthGrant,
+    table: &super::Table,
+    read_type: &[DataField],
+    predicates: &[Predicate],
+    implicit_system_fields: &[&str],
+) -> crate::Result<Vec<usize>> {
+    // The grant's positional indices only mean anything on the table it was
+    // issued for; `Table::authorize_rewrite_splits` is public, so a grant can
+    // arrive on another table's splits.
+    if !grant.matches_table(table) {
+        return Err(unsupported(
+            "a query-auth grant issued for a different table or schema cannot be \
+             enforced here; re-plan the scan"
+                .to_string(),
+        ));
+    }
+    grant.check_system_scope(read_type)?;
+    grant.check_system_scope_by_name(implicit_system_fields)?;
+
+    let fields = table.schema().fields();
+    let projected = canonical_projection(fields, read_type)?;
+    let mut filter_columns = HashSet::new();
+    for predicate in predicates {
+        predicate.collect_leaf_field_indices(&mut filter_columns);
+    }
+    scope_check(grant, fields, &filter_columns, Some(projected.clone()))?;
+    Ok(projected)
+}
+
+/// Scope check shared by the read/scan gates: fail closed when the caller filter
+/// references a masked column (pruning on its raw value would leak it) or
+/// touches one outside the grant. `projected = None` means all columns.
 pub(crate) fn scope_check(
     grant: &QueryAuthGrant,
     fields: &[DataField],
@@ -288,17 +405,19 @@ pub(crate) fn parse_auth_filters(
 ) -> Result<Vec<Predicate>> {
     filters
         .iter()
-        .filter(|f| !f.trim().is_empty())
+        // Java skips only length-0 entries (`StringUtils.isEmpty`). Whitespace
+        // is invalid JSON: dropping it could leave a grant with no filter.
+        .filter(|f| !f.is_empty())
         .map(|f| Predicate::from_rest_json(f, fields))
         .collect()
 }
 
 // ==================== Exact evaluation ====================
 
-/// Exactly evaluate the ANDed `predicates` against `batch` (whose columns
-/// correspond 1:1 to `batch_fields`; leaf indices refer to `schema_fields`)
-/// and drop non-matching rows. Unlike the pruning evaluators, anything that
-/// cannot be evaluated is an error — a security filter must not fall open.
+/// Evaluate the ANDed `predicates` against `batch` (columns 1:1 with
+/// `batch_fields`; leaf indices into `schema_fields`) and drop non-matching
+/// rows. Unlike the pruning evaluators, anything unevaluable is an error — a
+/// security filter must not fall open.
 pub(crate) fn strict_filter_batch(
     batch: &RecordBatch,
     predicates: &[Predicate],
@@ -366,12 +485,10 @@ fn strict_mask(
 
 /// Replace every NaN in a float column with the canonical (positive) NaN.
 ///
-/// Arrow's comparison kernels use a total ordering in which a NEGATIVE NaN sorts
-/// below every finite value, so an auth filter like `f < 0` would admit a
-/// negative-NaN row. Java canonicalizes NaN in `Float`/`Double.compare`, making
-/// every NaN greater than all finite values, so the row is rejected. Applied
-/// only to authorization filters — ordinary query pushdown keeps Arrow
-/// semantics. Signed zero already agrees with Java and is left alone.
+/// Arrow's total ordering sorts a NEGATIVE NaN below every finite value, so
+/// `f < 0` would admit it; Java's `Float`/`Double.compare` makes every NaN the
+/// greatest. Authorization filters only — ordinary pushdown keeps Arrow
+/// semantics. Signed zero already agrees.
 fn canonicalize_nan(column: &ArrayRef) -> ArrayRef {
     match column.data_type() {
         arrow_schema::DataType::Float32 => {
@@ -433,6 +550,15 @@ fn strict_leaf_mask(
     op: PredicateOperator,
     literals: &[Datum],
 ) -> Result<BooleanArray> {
+    // Decimals compare by value across scales (`datum_cmp`), which no Arrow
+    // scalar expresses — `literal_scalar_for_arrow_filter` returns `None` for
+    // them by design, so without this every decimal policy would error. The
+    // exact evaluator keeps nulls, so Kleene combination is unchanged.
+    if matches!(column.data_type(), arrow_schema::DataType::Decimal128(_, _))
+        && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+    {
+        return kleene(evaluate_decimal_leaf(column, op, literals));
+    }
     let scalar = |literal: &Datum| -> Result<arrow_array::Scalar<ArrayRef>> {
         literal_scalar_for_arrow_filter(literal, data_type)?.ok_or_else(|| {
             unsupported(format!(
@@ -537,11 +663,9 @@ pub(crate) fn parse_column_masking(
             .position(|f| f.name() == column)
             .ok_or_else(|| mask_err(format!("unknown field `{column}`")))?;
         let transform = Transform::from_rest_json(json, fields)?;
-        // The masked value replaces the column in place, so its type must match
-        // the column's; a type-changing transform (e.g. `CAST(id AS STRING)` on
-        // an INT column) cannot be represented and must fail closed rather than
-        // be cast back to the raw type. Types are compared via their arrow
-        // representation (nullability-agnostic).
+        // The masked value replaces the column in place, so a type-changing
+        // transform (`CAST(id AS STRING)` on an INT column) cannot be
+        // represented. Compared via the arrow type (nullability-agnostic).
         if let Some(out) = mask_output_type(&transform, fields) {
             let target_type = crate::arrow::paimon_type_to_arrow(fields[target].data_type())?;
             if out != target_type {
@@ -566,10 +690,9 @@ pub(crate) fn parse_column_masking(
     // Deterministic order regardless of map iteration.
     masks.sort_by_key(|m| m.column);
 
-    // Masks read their inputs from the RAW batch (like Java), so one mask that
-    // references ANOTHER mask's target would copy that column's unmasked value
-    // into its own output — defeating the second mask. Referencing your own
-    // target is the normal case (`name := UPPER(name)`) and stays valid.
+    // Masks read their inputs from the RAW batch (like Java), so a mask
+    // referencing ANOTHER mask's target would copy its unmasked value out.
+    // Referencing your own target (`name := UPPER(name)`) stays valid.
     let targets: HashSet<usize> = masks.iter().map(|m| m.column).collect();
     for mask in &masks {
         let mut inputs = HashSet::new();
@@ -652,10 +775,9 @@ pub(crate) fn mask_batch(
                 "query-auth mask references unknown field #{schema_index}"
             ))
         })?;
-        // Match on field id alone: the read type may carry the column under a
-        // different name (projection aliasing, or a renamed column read from an
-        // older file schema). Also matching the name would silently find no
-        // position and skip the mask, emitting the raw value.
+        // By field id alone: the read type may carry the column under another
+        // name (aliasing, or a rename seen from an older file schema), and
+        // matching the name too would skip the mask and emit the raw value.
         Ok(batch_fields
             .iter()
             .enumerate()
@@ -1144,6 +1266,136 @@ mod tests {
     }
 
     #[test]
+    fn test_implicit_system_fields_are_scope_checked() {
+        // The audit schema prepends `rowkind` (and may prepend
+        // `_SEQUENCE_NUMBER`) on top of the read type, so neither reaches the
+        // auth request via the projection and both need a by-name check.
+        let grant = QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            Some(HashSet::from([0])),
+            Some(HashSet::from(
+                [crate::spec::ROW_KIND_FIELD_NAME.to_string()],
+            )),
+            GrantBinding::default(),
+        );
+        assert!(grant
+            .check_system_scope_by_name(&[crate::spec::ROW_KIND_FIELD_NAME])
+            .is_ok());
+        assert!(grant
+            .check_system_scope_by_name(&[
+                crate::spec::ROW_KIND_FIELD_NAME,
+                crate::spec::SEQUENCE_NUMBER_FIELD_NAME,
+            ])
+            .is_err());
+        // An unscoped grant covers everything.
+        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, None, GrantBinding::default());
+        assert!(all
+            .check_system_scope_by_name(&[crate::spec::SEQUENCE_NUMBER_FIELD_NAME])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_whitespace_only_filter_fails_closed() {
+        use crate::spec::{DataType, IntType};
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        // Java skips only length-0 entries, so " " reaches the parser and throws.
+        // Dropping it here would leave a grant with no filter at all.
+        assert!(parse_auth_filters(&[" ".to_string()], &fields).is_err());
+        assert!(parse_auth_filters(&["\n".to_string()], &fields).is_err());
+        // A genuinely empty entry is still skipped (Java parity).
+        assert_eq!(
+            parse_auth_filters(&[String::new()], &fields).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_system_scope_does_not_make_a_grant_restricted() {
+        // `is_unrestricted` answers "did the server restrict, or did the client
+        // scope columns". The system scope answers a different question, so
+        // letting it gate this made every write/build path on a query-auth table
+        // fail: `authorize_unrestricted_read` would never see an unrestricted
+        // grant.
+        let scoped_system = QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(HashSet::new()),
+            GrantBinding::default(),
+        );
+        assert!(
+            scoped_system.is_unrestricted(),
+            "an empty system scope with no rules is still unrestricted"
+        );
+        assert!(!scoped_system.has_server_restrictions());
+
+        // Internal raw reads carry no system scoping at all.
+        let internal =
+            QueryAuthGrant::new(Vec::new(), Vec::new(), None, None, GrantBinding::default());
+        assert!(internal.is_unrestricted());
+    }
+
+    #[test]
+    fn test_full_projection_is_not_blanket_system_approval() {
+        use crate::spec::{DataType, IntType};
+        // `select = None` means "every table column", never "every reserved
+        // system field": the request only carries the system names the read
+        // needs, so anything else was never shown to the server.
+        let grant = QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(HashSet::new()),
+            GrantBinding::default(),
+        );
+        let row_id = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            DataType::Int(IntType::new()),
+        );
+        assert!(grant.check_system_scope(&[row_id]).is_err());
+        assert!(grant
+            .check_system_scope_by_name(&[crate::spec::ROW_KIND_FIELD_NAME])
+            .is_err());
+    }
+
+    #[test]
+    fn test_system_field_scope_is_enforced_by_name() {
+        use crate::spec::{DataType, IntType};
+        let row_id = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            DataType::Int(IntType::new()),
+        );
+        let seq = DataField::new(
+            crate::spec::SEQUENCE_NUMBER_FIELD_ID,
+            crate::spec::SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+            DataType::Int(IntType::new()),
+        );
+        // Authorized for _ROW_ID only: system fields have no table index, so the
+        // positional scope cannot cover them and they need their own check.
+        let grant = QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            Some(HashSet::from([0])),
+            Some(HashSet::from([crate::spec::ROW_ID_FIELD_NAME.to_string()])),
+            GrantBinding::default(),
+        );
+        assert!(grant
+            .check_system_scope(std::slice::from_ref(&row_id))
+            .is_ok());
+        assert!(grant.check_system_scope(&[seq]).is_err());
+        // An unscoped grant covers everything.
+        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, None, GrantBinding::default());
+        assert!(all.check_system_scope(&[row_id]).is_ok());
+    }
+
+    #[test]
     fn test_canonical_projection_system_and_dropped_fields() {
         use crate::spec::{DataType, IntType};
         let fields = vec![DataField::new(
@@ -1188,13 +1440,14 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            None,
             GrantBinding::default(),
         );
         assert!(!grant.is_unrestricted());
         assert!(grant.authorizes_columns([0]));
         assert!(!grant.authorizes_columns([1]));
         // `None` (all columns) with no filter/mask is fully unrestricted.
-        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, GrantBinding::default());
+        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, None, GrantBinding::default());
         assert!(all.is_unrestricted());
         assert!(all.authorizes_columns([0, 1, 99]));
     }

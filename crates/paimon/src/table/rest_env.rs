@@ -71,6 +71,12 @@ impl RESTEnv {
         }
     }
 
+    /// The REST catalog's table UUID: stable across renames and unique across
+    /// catalogs, unlike an identifier or the per-table schema counter.
+    pub(crate) fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
     #[cfg(test)]
     fn has_local_cache(&self) -> bool {
         self.local_cache.is_some()

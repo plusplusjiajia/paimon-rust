@@ -210,6 +210,8 @@ impl<'a> ReadBuilder<'a> {
     }
 
     /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Slicing by physical row id selects rows by `_ROW_ID` without any
+    /// predicate, so it must reach the auth request like a filter on it would.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -295,6 +297,9 @@ struct PaimonReadBuilder<'a> {
     /// split into partition/data conjuncts). The query-auth gates check these
     /// against the grant fetched at plan time.
     filter_columns: HashSet<usize>,
+    /// System columns (`_ROW_ID`, …) the caller filter referenced. They have no
+    /// table index, and row-id extraction strips the leaf before planning.
+    filter_system_names: HashSet<String>,
 }
 
 impl<'a> PaimonReadBuilder<'a> {
@@ -308,6 +313,7 @@ impl<'a> PaimonReadBuilder<'a> {
             row_ranges: None,
             case_sensitive: true,
             filter_columns: HashSet::new(),
+            filter_system_names: HashSet::new(),
         }
     }
 
@@ -367,12 +373,20 @@ impl<'a> PaimonReadBuilder<'a> {
     /// primary-key merge reads push key conjuncts below the merge and enforce
     /// the full predicate with an exact post-merge residual filter.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        // Capture the columns of the FULL predicate before it is split into
-        // partition/data conjuncts, so both the masked-column guard and the
-        // authorized-scope check see a masked/unauthorized partition key (which
-        // would otherwise be pruned on its raw value).
+        // Capture the FULL predicate's columns before it is split into
+        // partition/data conjuncts, so the guards see a masked partition key
+        // that would otherwise be pruned on its raw value.
         self.filter_columns.clear();
-        filter.collect_leaf_field_indices(&mut self.filter_columns);
+        filter.collect_user_leaf_field_indices(&mut self.filter_columns);
+        // System columns too, and BEFORE `try_extract_row_id_ranges` strips the
+        // `_ROW_ID` leaf: it selects rows by that column without ever appearing
+        // in the read type, so the server must still get to refuse it.
+        let mut names = std::collections::HashSet::new();
+        filter.collect_leaf_column_names(&mut names);
+        self.filter_system_names = names
+            .into_iter()
+            .filter(|n| crate::table::query_auth::is_reserved_system_field_name(n.as_str()))
+            .collect();
         self.filter = normalize_filter(self.table, filter);
         self.try_extract_row_id_ranges();
         self
@@ -391,6 +405,8 @@ impl<'a> PaimonReadBuilder<'a> {
     }
 
     /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Slicing by physical row id selects rows by `_ROW_ID` without any
+    /// predicate, so it must reach the auth request like a filter on it would.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         self.row_ranges = if ranges.is_empty() {
             None
@@ -445,10 +461,9 @@ impl<'a> PaimonReadBuilder<'a> {
         let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
-        // The grant's auth field IDs are folded into the scan projection inside
-        // `TableScan::plan` — where the grant has been fetched — not here, where
-        // it does not yet exist (that early read of an empty grant was a
-        // fail-open row-filter bypass).
+        // The grant's field ids are folded into the projection in
+        // `TableScan::plan`, where it has been fetched; reading an empty grant
+        // here was a fail-open row-filter bypass.
         let read_type = self.resolve_read_type().unwrap_or(None);
         TableScan::new(
             self.table,
@@ -474,24 +489,18 @@ impl<'a> PaimonReadBuilder<'a> {
     /// Projected system fields (`_ROW_ID`, …). `projected_schema_indices` drops
     /// them for lack of an index, but Java's `select` includes them.
     fn projected_system_field_names(&self) -> Vec<String> {
-        self.resolve_read_type()
-            .ok()
-            .flatten()
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter(|f| crate::table::query_auth::is_reserved_system_field(f))
-                    .map(|f| f.name().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        crate::table::query_auth::projected_system_field_names(
+            self.resolve_read_type().ok().flatten().as_deref(),
+            &self.filter_system_names,
+            self.row_ranges.is_some(),
+        )
     }
 
     fn projected_schema_indices(&self) -> Option<Vec<usize>> {
         // Resolve names too: a `with_projection` selection lives in
-        // `projection_names`, and scoping the grant to all columns would deny a
-        // user authorized for exactly the requested subset. An unresolvable
-        // projection falls back to the full scope; `new_read` reports the error.
+        // `projection_names`, and scoping to all columns would deny a user
+        // authorized for exactly the subset. Unresolvable falls back to full
+        // scope; `new_read` reports the error.
         self.resolve_read_type().ok().flatten().map(|fields| {
             fields
                 .iter()
@@ -508,10 +517,8 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        // Query-auth is enforced in `TableRead::to_arrow` off the grant stamped
-        // on the splits by planning (fail closed when a query-auth table's
-        // splits carry no grant), so no gate is needed at read construction —
-        // an empty-splits fast path produces no rows to leak.
+        // Enforced in `TableRead::to_arrow` off the grant planning stamped on
+        // the splits, so read construction needs no gate.
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,
@@ -957,6 +964,7 @@ mod tests {
             vec![auth_filter],
             Vec::new(),
             None,
+            None,
             crate::table::query_auth::GrantBinding::of(&table),
         ));
 
@@ -1034,6 +1042,7 @@ mod tests {
             vec![auth_filter],
             masks,
             None,
+            None,
             crate::table::query_auth::GrantBinding::of(&table),
         ));
 
@@ -1074,6 +1083,34 @@ mod tests {
         assert!(err.to_string().contains("masked column"), "got: {err}");
     }
 
+    #[test]
+    fn test_row_id_filter_reaches_the_auth_select() {
+        // `try_extract_row_id_ranges` strips the `_ROW_ID` leaf from the
+        // predicates during `with_filter`, so collecting system names from the
+        // surviving predicates afterwards would never see it.
+        let table = crate::table::query_auth_table();
+        let mut rb = table.new_read_builder();
+        let filter = crate::spec::Predicate::Leaf {
+            index: 0,
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            data_type: crate::spec::DataType::BigInt(crate::spec::BigIntType::new()),
+            op: crate::spec::PredicateOperator::GtEq,
+            literals: vec![crate::spec::Datum::Long(5)],
+        };
+        rb.with_filter(filter);
+        let names = paimon_builder(&rb).projected_system_field_names();
+        assert!(
+            names.iter().any(|n| n == crate::spec::ROW_ID_FIELD_NAME),
+            "a _ROW_ID filter must reach the auth select, got {names:?}"
+        );
+
+        // An explicit row-range slice selects by `_ROW_ID` with no predicate.
+        let mut rb2 = table.new_read_builder();
+        rb2.with_row_ranges(vec![crate::table::RowRange::new(0, 10)]);
+        let names2 = paimon_builder(&rb2).projected_system_field_names();
+        assert!(names2.iter().any(|n| n == crate::spec::ROW_ID_FIELD_NAME));
+    }
+
     #[tokio::test]
     async fn test_query_auth_scope_rejects_unauthorized_column() {
         use crate::table::query_auth::QueryAuthGrant;
@@ -1085,6 +1122,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::new()),
+            None,
             crate::table::query_auth::GrantBinding::of(&table),
         ));
         let split = DataSplitBuilder::new()

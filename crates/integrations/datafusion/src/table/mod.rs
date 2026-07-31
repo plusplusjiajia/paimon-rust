@@ -372,18 +372,24 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        Ok(Arc::new(PaimonTableScan::new(
-            projected_schema,
-            self.table.clone(),
-            read_type,
-            self.pushed_predicate,
-            planned_partitions,
-            self.limit,
-            self.filter_exact,
-            self.scan_trace,
-            None,
-            self.case_sensitive,
-        )))
+        // From the plan, not its splits: a fully pruned plan carries no split
+        // to stamp, but its scan metadata is just as pre-enforcement.
+        let restricted = self.plan.planned_under_restricted_grant();
+        Ok(Arc::new(
+            PaimonTableScan::new(
+                projected_schema,
+                self.table.clone(),
+                read_type,
+                self.pushed_predicate,
+                planned_partitions,
+                self.limit,
+                self.filter_exact,
+                self.scan_trace,
+                None,
+                self.case_sensitive,
+            )
+            .with_query_auth_restricted(restricted),
+        ))
     }
 }
 

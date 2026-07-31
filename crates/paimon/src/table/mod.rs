@@ -232,23 +232,21 @@ impl Table {
         })
     }
 
-    /// Authorize this user against the REST server when `query-auth.enabled` is
-    /// set: fetch and parse the per-user row filter / column masking and return
-    /// it as the grant the read pipeline enforces. `select` are the queried
-    /// columns (table-schema indices; `None` = all) — like Java's
-    /// `readType.getFieldNames()`, so a column-restricted user can still read
-    /// an authorized subset; the grant is scoped to exactly those columns and a
-    /// wider read fails closed until it re-plans. Returns `None` when the table
-    /// is not `query-auth.enabled`. Called from scan planning and search
-    /// execution at the same per-plan frequency as Java's
-    /// `CatalogEnvironment.tableQueryAuth()`, so a revoked grant takes effect on
-    /// the next plan. The grant is threaded to the read on the split it plans
-    /// (never a shared mutable slot), so it is per-query and cannot leak into a
-    /// concurrent query or a write-path rewrite.
+    /// Fetch the per-user row filter / column masking as the grant the read
+    /// pipeline enforces; `None` when the table is not `query-auth.enabled`.
+    ///
+    /// `select` are the queried columns (table-schema indices, `None` = all),
+    /// like Java's `readType.getFieldNames()`: a column-restricted user can
+    /// read an authorized subset, and a wider read fails closed until it
+    /// re-plans. Called per plan, as Java's `CatalogEnvironment.tableQueryAuth`
+    /// is, so a revoked grant takes effect on the next one.
+    /// `system_select` is `None` for internal raw reads, which run only under a
+    /// fully unrestricted grant and legitimately touch `_ROW_ID`; scan planning
+    /// always passes `Some(names)`, and an empty slice then approves none.
     pub(crate) async fn verify_query_auth_for_read(
         &self,
         select: Option<&HashSet<usize>>,
-        system_select: &[String],
+        system_select: Option<&[String]>,
     ) -> Result<Option<Arc<QueryAuthGrant>>> {
         if !CoreOptions::new(self.schema.options()).query_auth_enabled() {
             return Ok(None);
@@ -263,33 +261,59 @@ impl Table {
         let fields = self.schema.fields();
         // Java's `select` is `readType.getFieldNames()`, so projected system
         // fields go too. They have no index to scope, but the server may still
-        // refuse them.
-        let select_names = select.map(|indices| {
-            fields
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| indices.contains(i))
-                .map(|(_, f)| f.name().to_string())
-                .chain(system_select.iter().cloned())
-                .collect::<Vec<_>>()
-        });
+        // refuse them — which it can only do if they are actually sent, so a
+        // full read that wants one must spell out every column rather than rely
+        // on a null select.
+        let wanted_system: &[String] = system_select.unwrap_or(&[]);
+        let select_names = match select {
+            Some(indices) => Some(
+                fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| indices.contains(i))
+                    .map(|(_, f)| f.name().to_string())
+                    .chain(wanted_system.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ),
+            None if wanted_system.is_empty() => None,
+            None => Some(
+                fields
+                    .iter()
+                    .map(|f| f.name().to_string())
+                    .chain(wanted_system.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ),
+        };
         let auth = rest_env.table_query_auth(select_names).await?;
         let filters = query_auth::parse_auth_filters(&auth.filter.unwrap_or_default(), fields)?;
         let masks =
             query_auth::parse_column_masking(&auth.column_masking.unwrap_or_default(), fields)?;
+
+        // Rules are expressed against the LATEST schema, but this `Table` may
+        // predate a concurrent evolution: a re-added column keeps its name and
+        // gets a fresh id. Java re-validates on every plan.
+        // Also with no rules: `select` names columns of THIS copy's schema, so a
+        // column dropped since would be authorized against a latest schema that
+        // no longer has it, while the read still decodes it by field id.
+        // Always, not just when rules exist: `select` (and `None`, meaning every
+        // column of THIS copy) names columns of this schema, so one dropped
+        // since would be authorized against a latest schema that no longer has
+        // it while the read still decodes it by field id.
+        self.ensure_rules_bind_to_latest_schema(&filters, &masks, select)
+            .await?;
         let grant = QueryAuthGrant::new(
             filters,
             masks,
             select.cloned(),
+            system_select.map(|names| names.iter().cloned().collect()),
             query_auth::GrantBinding::of(self),
         );
 
-        // The server expresses its rules against the table's CURRENT schema, but
-        // a time-travelled or branch copy reads a DIFFERENT one. Binding those
-        // rules by name onto it is unsound — a column dropped and re-added under
-        // the same name has a different field id, so a filter or mask would bind
-        // to an unrelated historical column. Fail closed rather than mis-bind.
-        if !grant.is_unrestricted() && (self.time_traveled || self.branch_reference) {
+        // Rules are expressed against the CURRENT schema; a time-travelled or
+        // branch copy reads a different one, where the same name may be an
+        // unrelated field id. Keyed on server rules, not `is_unrestricted()`:
+        // the client's own projection scope binds nothing to the schema.
+        if grant.has_server_restrictions() && (self.time_traveled || self.branch_reference) {
             return Err(crate::Error::Unsupported {
                 message: "a query-auth row filter / column masking grant cannot be applied to a \
                           time-travelled or branch read: the grant is bound to the table's \
@@ -301,14 +325,81 @@ impl Table {
         Ok(Some(Arc::new(grant)))
     }
 
-    /// Authorize a read that cannot enforce a row filter / masking on its output
-    /// (search, system tables, or a write-path rewrite that must read raw).
-    /// Returns the grant to stamp on the splits it reads (`None` = not a
-    /// query-auth table). Fails closed when the grant is restricted — such a
-    /// path must never run under a partial grant, since it would either leak
-    /// (search/metadata) or silently drop/mask rows into a committed rewrite.
+    /// Fail closed when a rule column binds to a different field in the latest
+    /// schema than in this copy — a rename or drop-and-re-add would apply the
+    /// rule to unrelated data. Mirrors Java `validateReadableWithoutRename`.
+    async fn ensure_rules_bind_to_latest_schema(
+        &self,
+        filters: &[crate::spec::Predicate],
+        masks: &[query_auth::ColumnMask],
+        select: Option<&HashSet<usize>>,
+    ) -> Result<()> {
+        // Compare ids before loading: the directory listing is the freshness
+        // check and cannot be skipped, but the schema itself need not be read
+        // when this copy is already current (the common case).
+        // A table with no on-disk schema directory has no drift to detect — the
+        // REST-provided schema is all there is. Listing it is also the only file
+        // access on this path, so a table whose location is not readable (mock
+        // catalogs, tables served entirely over REST) must not fail the read.
+        let Ok(ids) = self.schema_manager.list_all_ids().await else {
+            return Ok(());
+        };
+        let Some(&latest_id) = ids.last() else {
+            return Ok(());
+        };
+        if latest_id == self.schema.id() {
+            return Ok(());
+        }
+        let latest = self.schema_manager.schema(latest_id).await?;
+        let mut referenced = HashSet::new();
+        for filter in filters {
+            filter.collect_leaf_field_indices(&mut referenced);
+        }
+        for mask in masks {
+            referenced.insert(mask.column);
+            mask.transform.collect_field_indices(&mut referenced);
+        }
+        let fields = self.schema.fields();
+        match select {
+            Some(select) => referenced.extend(select.iter().copied()),
+            // `None` = every column of this copy, which is exactly what a full
+            // read decodes.
+            None => referenced.extend(0..fields.len()),
+        }
+        for index in referenced {
+            let Some(field) = fields.get(index) else {
+                continue;
+            };
+            // Type too, not just name and id: `disable-explicit-type-casting`
+            // defaults to false, so a narrowing evolution (DOUBLE -> FLOAT) is
+            // allowed. The auth JSON is parsed and evaluated against THIS
+            // copy's type, so `x > 0.1` on a stale DOUBLE would admit values the
+            // current FLOAT semantics reject.
+            let matched = latest
+                .fields()
+                .iter()
+                .find(|f| f.name() == field.name())
+                .is_some_and(|f| f.id() == field.id() && f.data_type() == field.data_type());
+            if !matched {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "query-auth read references column `{}`, which the table's latest \
+                         schema exposes as a different column (renamed, or dropped and \
+                         re-added); refusing to read rather than apply it to unrelated data",
+                        field.name()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Authorize a read that cannot enforce filtering / masking on its output
+    /// (search, system tables, write-path rewrites). Returns the grant to stamp
+    /// on its splits; fails closed on a restricted one, which would either leak
+    /// (search/metadata) or commit a filtered view (rewrites).
     pub(crate) async fn authorize_unrestricted_read(&self) -> Result<Option<Arc<QueryAuthGrant>>> {
-        match self.verify_query_auth_for_read(None, &[]).await? {
+        match self.verify_query_auth_for_read(None, None).await? {
             Some(grant) if grant.is_unrestricted() => Ok(Some(grant)),
             Some(_) => Err(crate::Error::Unsupported {
                 message: "this read on a 'query-auth.enabled' table must see raw rows, so it \
@@ -323,11 +414,10 @@ impl Table {
     /// Authorize an internal read that rewrites data (copy-on-write DML, index
     /// builds) and stamp the grant on `splits`.
     ///
-    /// Such a read must see raw rows — rewriting from a filtered or masked view
-    /// would destroy hidden rows and persist masked values — so it requires a
-    /// fully unrestricted grant and fails closed otherwise. The grant the caller
-    /// would get from scan planning must NOT be used here: under a row filter it
-    /// shifts row offsets, and rewrites replay those offsets.
+    /// Rewriting from a filtered or masked view would destroy hidden rows and
+    /// persist masked values, so this requires a fully unrestricted grant. Scan
+    /// planning's grant must NOT be used: a row filter shifts the positional
+    /// row offsets rewrites replay.
     pub async fn authorize_rewrite_splits(&self, splits: Vec<DataSplit>) -> Result<Vec<DataSplit>> {
         // This is the only public API that stamps a grant, so it must not be
         // usable to launder splits: refuse ones that already carry a restricted
@@ -339,6 +429,25 @@ impl Table {
                     .to_string(),
             });
         }
+        // Catch another table's splits being handed to a permissive one.
+        // Bucket paths only: `external_path` legitimately points anywhere. A
+        // sanity guard, not a boundary against in-process code.
+        let root = self.location().trim_end_matches('/');
+        if let Some(split) = splits.iter().find(|s| {
+            // On a component boundary: `.../t` must reject `.../t2`.
+            s.bucket_path()
+                .trim_end_matches('/')
+                .strip_prefix(root)
+                .is_none_or(|rest| !rest.is_empty() && !rest.starts_with('/'))
+        }) {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "cannot authorize a split at `{}`: it does not belong to table `{}`",
+                    split.bucket_path(),
+                    self.identifier().full_name()
+                ),
+            });
+        }
         let grant = self.authorize_unrestricted_read().await?;
         Ok(splits
             .into_iter()
@@ -346,11 +455,10 @@ impl Table {
             .collect())
     }
 
-    /// Authorize a commit. Writes must require a fully unrestricted grant: the
-    /// data being committed may have come from an enforced read (e.g. `INSERT
-    /// OVERWRITE t SELECT * FROM t`), which would destroy rows the grant hid and
-    /// persist masked values as the stored data. Committing cannot tell where
-    /// its rows came from, so it fails closed for any restricted grant.
+    /// Authorize a commit. The data may have come from an enforced read (e.g.
+    /// `INSERT OVERWRITE t SELECT * FROM t`), which would destroy hidden rows
+    /// and persist masked values; committing cannot tell, so it fails closed
+    /// for any restricted grant.
     pub(crate) async fn authorize_unrestricted_write(&self) -> Result<()> {
         self.authorize_unrestricted_read().await.map(|_| ())
     }
@@ -589,10 +697,9 @@ impl Table {
             })?;
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
-        // `query-auth.enabled` is delivered by the REST catalog on the table
-        // response, so the branch's on-disk schema need not carry it. Inherit it
-        // from this table: a branch references the same data files, and dropping
-        // the flag here would make `t$branch_x` read them raw, unauthorized.
+        // The flag comes from the REST table response, not the branch's on-disk
+        // schema. A branch references the same files, so dropping it would make
+        // `t$branch_x` read them unauthorized.
         let branch_schema = if CoreOptions::new(self.schema.options()).query_auth_enabled() {
             schema
                 .copy_with_replaced_options(options)
@@ -671,11 +778,9 @@ pub(crate) fn query_auth_table() -> Table {
 mod tests {
     #[tokio::test]
     async fn test_authorize_unrestricted_read_fails_closed() {
-        // Every write/build path (cow_writer, data_evolution_writer, btree index
-        // build, cross-partition bucket assign) authorizes through this gate
-        // before its internal read. A query-auth table it cannot authorize as
-        // unrestricted must fail closed rather than read raw and rewrite
-        // filtered/masked data into a committed result.
+        // Every write/build path authorizes through this gate before its
+        // internal read, so a table it cannot authorize as unrestricted must
+        // fail closed rather than commit a filtered/masked view.
         let table = super::query_auth_table();
         let err = table.authorize_unrestricted_read().await.unwrap_err();
         assert!(
@@ -684,6 +789,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_latest_schema_check_tolerates_an_unlistable_location() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+        // The check is the only file access on the authorization path. A table
+        // served entirely over REST — or a mock catalog — may point at a
+        // location with no schema directory, and that must not fail the read.
+        let table = super::Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "t"),
+            "/nonexistent-a1b2c3/does/not/exist".to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+        assert!(
+            table
+                .ensure_rules_bind_to_latest_schema(&[], &[], None)
+                .await
+                .is_ok(),
+            "an unlistable location must not fail authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_rewrite_splits_rejects_foreign_splits() {
+        use crate::spec::BinaryRow;
+        use crate::table::DataSplitBuilder;
+
+        let table = super::query_auth_table();
+        let root = table.location().to_string();
+        let split_at = |path: &str| {
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(path.to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![])
+                .build()
+                .unwrap()
+        };
+
+        // A sibling sharing this location's prefix must not pass.
+        let sibling = format!("{root}2/bucket-0");
+        let err = table
+            .authorize_rewrite_splits(vec![split_at(&sibling)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("does not belong to table")),
+            "prefix-sharing sibling must be rejected, got: {err}"
+        );
+
+        // Its own split passes provenance and fails later, at authorization.
+        let own = format!("{root}/bucket-0");
+        let err = table
+            .authorize_rewrite_splits(vec![split_at(&own)])
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("does not belong to table"),
+            "own split must pass the provenance check, got: {err}"
+        );
+    }
+
+    // `copy_with_branch` lists the schema directory, and opendal's fs lister
+    // panics on Windows when stripping the prefix of a `file:/C:/…` path.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_branch_copy_inherits_query_auth_flag() {
         use crate::catalog::Identifier;
@@ -694,7 +875,15 @@ mod tests {
         // on-disk schema; if `copy_with_branch` dropped it, `t$branch_x` would
         // read the same files unauthorized. Drive the real method.
         let tmp = tempfile::tempdir().unwrap();
-        let location = tmp.path().display().to_string();
+        // `file:` URL with forward slashes; a bare path breaks on Windows.
+        let location = {
+            let p = tmp.path().to_string_lossy().replace('\\', "/");
+            if p.starts_with('/') {
+                format!("file:{p}")
+            } else {
+                format!("file:/{p}")
+            }
+        };
         let file_io = FileIOBuilder::new("file").build().unwrap();
 
         // The on-disk schema deliberately has NO query-auth option.

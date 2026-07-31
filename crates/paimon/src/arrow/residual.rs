@@ -368,7 +368,7 @@ pub(crate) fn evaluate_exact_leaf_predicate(
 /// operator, including finer-scale literals that cannot be represented at the
 /// column scale (e.g. `d > 1.05` on a DECIMAL(_,1) column is exactly `d >= 1.1`).
 /// NULL rows stay NULL in the mask (collapsed to `false` by the caller).
-fn evaluate_decimal_leaf(
+pub(crate) fn evaluate_decimal_leaf(
     array: &ArrayRef,
     op: PredicateOperator,
     literals: &[Datum],
