@@ -3734,6 +3734,30 @@ mod tests {
     }
 
     #[test]
+    fn test_data_evolution_group_is_not_pruned_by_a_row_id_predicate() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let row_id =
+            crate::spec::row_id_leaf(crate::spec::PredicateOperator::GtEq, vec![Datum::Long(100)]);
+
+        assert!(data_evolution_group_matches_predicates(
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&row_id),
+            &fields,
+        ));
+        assert!(data_evolution_group_matches_predicates(
+            &[file],
+            &[Predicate::negate(row_id)],
+            &fields,
+        ));
+    }
+
+    #[test]
     fn test_data_evolution_group_matches_not_prunes_when_inner_must_match() {
         let fields = int_field();
         let file = test_data_file_meta(
