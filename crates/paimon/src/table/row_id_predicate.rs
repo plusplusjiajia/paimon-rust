@@ -165,10 +165,12 @@ fn leaf_to_ranges(op: PredicateOperator, literals: &[Datum]) -> Option<Vec<RowRa
             Some(vec![RowRange::new(0, v - 1)])
         }
         PredicateOperator::In => {
+            // EVERY literal, or none: ranges standing for only part of the leaf
+            // would still read as the whole of it and drop the conjunct.
             let mut ranges: Vec<RowRange> = literals
                 .iter()
-                .filter_map(|d| datum_to_i64(d).map(|v| RowRange::new(v, v)))
-                .collect();
+                .map(|d| datum_to_i64(d).map(|v| RowRange::new(v, v)))
+                .collect::<Option<Vec<_>>>()?;
             if ranges.is_empty() {
                 return None;
             }
@@ -180,6 +182,11 @@ fn leaf_to_ranges(op: PredicateOperator, literals: &[Datum]) -> Option<Vec<RowRa
 }
 
 /// Intersect two sorted range lists.
+/// Intersect two range lists that are already sorted and merged.
+pub(crate) fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+    intersect_range_lists(a, b)
+}
+
 fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     let mut result = Vec::new();
     let (mut i, mut j) = (0, 0);
@@ -200,6 +207,23 @@ fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_a_partially_convertible_in_is_not_converted_at_all() {
+        let partial = row_id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Long(5), Datum::String("7".into())],
+        );
+        assert_eq!(extract_row_id_ranges(&partial), None);
+        assert!(!ranges_represent_conjunct(&partial));
+
+        let whole = row_id_leaf(PredicateOperator::In, vec![Datum::Long(5), Datum::Long(7)]);
+        assert_eq!(
+            extract_row_id_ranges(&whole),
+            Some(vec![RowRange::new(5, 5), RowRange::new(7, 7)])
+        );
+        assert!(ranges_represent_conjunct(&whole));
+    }
     use super::*;
     use crate::spec::row_id_leaf;
     use crate::spec::{BigIntType, DataType};

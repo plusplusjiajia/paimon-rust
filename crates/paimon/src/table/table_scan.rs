@@ -383,13 +383,9 @@ fn split_row_ranges_for_files(
             .flat_map(|file| intersect_ranges_with_file(ranges, file))
             .collect(),
     );
-    if split_ranges.is_empty() {
-        return Err(crate::Error::DataInvalid {
-            message: "Planned data-evolution split does not overlap selected row ranges"
-                .to_string(),
-            source: None,
-        });
-    }
+    // Empty means this split holds none of the selected rows. Only data
+    // evolution prunes such splits away up front (`RowRangeIndex`), so on a
+    // row-tracking table they reach here legitimately and the caller drops them.
     Ok(Some(split_ranges))
 }
 
@@ -1436,10 +1432,16 @@ impl<'a> PaimonTableScan<'a> {
                         .to_string(),
             });
         }
-        if self.row_ranges.is_some() {
+        // Both forms: without `first_row_id` a filter stays an ordinary data
+        // predicate instead of becoming a row range.
+        if self.row_ranges.is_some()
+            || self
+                .data_predicates
+                .iter()
+                .any(super::row_id_predicate::references_row_id)
+        {
             return Err(crate::Error::Unsupported {
-                message: "Batch incremental Diff does not support _ROW_ID row-range filters"
-                    .to_string(),
+                message: "Batch incremental Diff does not support _ROW_ID filters".to_string(),
             });
         }
         // A limit hint cannot be pushed into either side of a Diff: truncating
@@ -1947,6 +1949,12 @@ impl<'a> PaimonTableScan<'a> {
 
                 let split_row_ranges =
                     split_row_ranges_for_files(effective_row_ranges.as_deref(), &file_group)?;
+                if split_row_ranges
+                    .as_deref()
+                    .is_some_and(<[RowRange]>::is_empty)
+                {
+                    continue;
+                }
 
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
@@ -2252,9 +2260,11 @@ mod tests {
             if message.contains("missing or invalid row-id range")));
 
         let outside = make_evo_file("outside", 1, 2, 0, Some(10));
-        let error = split_row_ranges_for_files(Some(&ranges), &[outside]).unwrap_err();
-        assert!(matches!(error, Error::DataInvalid { message, .. }
-            if message.contains("does not overlap selected row ranges")));
+        assert_eq!(
+            split_row_ranges_for_files(Some(&ranges), &[outside]).unwrap(),
+            Some(Vec::new()),
+            "a split holding none of the selected rows is dropped, not an error"
+        );
     }
 
     fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
