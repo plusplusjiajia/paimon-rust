@@ -348,6 +348,32 @@ impl SQLContext {
         paimon_provider.register_temp_table(&database, &table_name, table)
     }
 
+    /// Whether `name` was registered through the Paimon registration path.
+    pub fn is_paimon_catalog(&self, name: &str) -> bool {
+        self.catalogs.contains_key(name)
+    }
+
+    /// Register an engine for a non-Paimon table type (the declared `type`
+    /// table option, e.g. `iceberg-table`) on a registered Paimon catalog.
+    /// See [`crate::catalog::PaimonCatalogProvider::register_table_engine`].
+    pub fn register_catalog_table_engine(
+        &self,
+        catalog_name: &str,
+        table_type: &str,
+        resolver: Arc<dyn crate::catalog::TableEngineResolver>,
+    ) -> DFResult<()> {
+        let catalog_provider = self
+            .ctx
+            .catalog(catalog_name)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
+        let paimon_provider = catalog_provider
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog_name}' is not a Paimon catalog"))
+            })?;
+        paimon_provider.register_table_engine(table_type, resolver)
+    }
+
     /// Deregisters a temporary table or view.
     ///
     /// Accepts the same flexible name format as `register_temp_table`.

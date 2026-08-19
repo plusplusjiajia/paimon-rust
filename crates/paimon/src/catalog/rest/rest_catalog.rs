@@ -215,6 +215,35 @@ impl Catalog for RESTCatalog {
         .await
     }
 
+    async fn load_table_routing(
+        &self,
+        identifier: &Identifier,
+        non_paimon_types: &std::collections::HashSet<String>,
+    ) -> Result<crate::catalog::RoutedTableLoad> {
+        let response = RESTEnv::fetch_table_response(identifier, &self.api).await?;
+        if let Some(schema) = response.schema.as_ref() {
+            if let Some(declared) = schema.options().get("type") {
+                let declared = declared.to_ascii_lowercase();
+                if non_paimon_types.contains(&declared) {
+                    // Neither this client nor an engine resolver can enforce
+                    // the server-side row filter / column masking.
+                    crate::spec::CoreOptions::new(schema.options()).ensure_read_authorized()?;
+                    return Ok(crate::catalog::RoutedTableLoad::NonPaimon(declared));
+                }
+            }
+        }
+        RESTEnv::build_table(
+            identifier,
+            response,
+            self.api.clone(),
+            self.options.clone(),
+            self.data_token_enabled,
+            self.local_cache.clone(),
+        )
+        .await
+        .map(|table| crate::catalog::RoutedTableLoad::Paimon(Box::new(table)))
+    }
+
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
         self.api
             .list_tables(database_name)

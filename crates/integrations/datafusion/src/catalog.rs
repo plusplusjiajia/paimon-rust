@@ -43,6 +43,95 @@ use crate::{BlobReaderRegistry, DynamicOptions};
 
 pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
 
+/// Engine registry shared between the catalog provider and its schema
+/// providers, so registrations stay visible to schemas obtained earlier.
+type TableEngines = Arc<RwLock<HashMap<String, Arc<dyn TableEngineResolver>>>>;
+
+/// Resolves tables owned by a non-Paimon engine, selected by the declared
+/// `type` table option (see [`PaimonCatalogProvider::register_table_engine`]).
+/// `Ok(None)` means not found; errors are propagated verbatim so an engine
+/// failure never masquerades as a missing table.
+#[async_trait]
+pub trait TableEngineResolver: Debug + Send + Sync {
+    /// Resolve `database.table` to the engine's table provider.
+    async fn resolve_table(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>>;
+}
+
+/// Read-only wrapper around an engine-resolved provider: reads delegate,
+/// DML is rejected. Keeps routed tables on the same fail-closed stance as
+/// the raw `get_table` paths even when the engine's provider is writable.
+#[derive(Debug)]
+struct ReadOnlyTableProvider {
+    inner: Arc<dyn TableProvider>,
+    declared: String,
+    table_name: String,
+}
+
+#[async_trait]
+impl TableProvider for ReadOnlyTableProvider {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.inner.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(plan_datafusion_err!(
+            "write is not supported for routed '{}' tables ('{}')",
+            self.declared,
+            self.table_name
+        ))
+    }
+}
+
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
 ///
@@ -65,6 +154,9 @@ pub struct PaimonCatalogProvider {
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
+    /// Engines for non-Paimon table types, keyed by the declared `type` table
+    /// option. Same poison-recovery stance as `temp_tables`.
+    table_engines: TableEngines,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -90,6 +182,7 @@ impl PaimonCatalogProvider {
             blob_reader_registry,
             session_state,
             schema_force_view_types: true,
+            table_engines: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -102,24 +195,43 @@ impl PaimonCatalogProvider {
         self.schema_force_view_types = schema_force_view_types;
         self
     }
-}
 
-impl CatalogProvider for PaimonCatalogProvider {
-    fn schema_names(&self) -> Vec<String> {
-        let catalog = Arc::clone(&self.catalog);
-        block_on_with_runtime(
-            async move {
-                catalog.list_databases().await.unwrap_or_else(|e| {
-                    log::error!("failed to list databases: {e}");
-                    vec![]
-                })
-            },
-            "paimon catalog access thread panicked",
-        )
+    /// Register an engine for a non-Paimon table type (e.g. `iceberg-table`).
+    /// References whose metadata declares that type resolve through
+    /// `resolver`; everything else takes the Paimon path unchanged. Kept
+    /// inside the provider so the registered catalog type never changes and
+    /// downcast-based paths (temp tables, time travel) keep working.
+    pub fn register_table_engine(
+        &self,
+        table_type: impl Into<String>,
+        resolver: Arc<dyn TableEngineResolver>,
+    ) -> DFResult<()> {
+        // Metadata publishes lowercase TableType values.
+        let table_type = table_type.into().to_ascii_lowercase();
+        // A Paimon-managed type would be split between engines: reads via
+        // the resolver, raw get_table paths via Paimon.
+        if !paimon::spec::is_non_paimon_table_type(&table_type) {
+            return Err(plan_datafusion_err!(
+                "table type '{table_type}' is Paimon-managed and cannot be routed to a \
+                 table engine; routable types: {:?}",
+                paimon::spec::NON_PAIMON_TABLE_TYPES
+            ));
+        }
+        self.table_engines
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_type, resolver);
+        Ok(())
     }
 
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+    fn table_engines(&self) -> TableEngines {
+        Arc::clone(&self.table_engines)
+    }
+
+    /// The Paimon-side schema resolution.
+    fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let catalog = Arc::clone(&self.catalog);
+        let table_engines = self.table_engines();
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
         let catalog_name = self.catalog_name.clone();
@@ -145,7 +257,8 @@ impl CatalogProvider for PaimonCatalogProvider {
                             blob_reader_registry,
                             session_state,
                         )
-                        .with_schema_force_view_types(schema_force_view_types),
+                        .with_schema_force_view_types(schema_force_view_types)
+                        .with_table_engines(Arc::clone(&table_engines)),
                     ) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
@@ -159,7 +272,8 @@ impl CatalogProvider for PaimonCatalogProvider {
                                     blob_reader_registry,
                                     session_state,
                                 )
-                                .with_schema_force_view_types(schema_force_view_types),
+                                .with_schema_force_view_types(schema_force_view_types)
+                                .with_table_engines(Arc::clone(&table_engines)),
                             ) as Arc<dyn SchemaProvider>)
                         } else {
                             None
@@ -173,6 +287,25 @@ impl CatalogProvider for PaimonCatalogProvider {
             },
             "paimon catalog access thread panicked",
         )
+    }
+}
+
+impl CatalogProvider for PaimonCatalogProvider {
+    fn schema_names(&self) -> Vec<String> {
+        let catalog = Arc::clone(&self.catalog);
+        block_on_with_runtime(
+            async move {
+                catalog.list_databases().await.unwrap_or_else(|e| {
+                    log::error!("failed to list databases: {e}");
+                    vec![]
+                })
+            },
+            "paimon catalog access thread panicked",
+        )
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        self.paimon_schema(name)
     }
 
     fn register_schema(
@@ -343,6 +476,8 @@ pub struct PaimonSchemaProvider {
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
+    /// Engines for non-Paimon table types; empty without routing.
+    table_engines: TableEngines,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -375,11 +510,17 @@ impl PaimonSchemaProvider {
             blob_reader_registry,
             session_state,
             schema_force_view_types: true,
+            table_engines: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
         self.schema_force_view_types = schema_force_view_types;
+        self
+    }
+
+    pub(crate) fn with_table_engines(mut self, table_engines: TableEngines) -> Self {
+        self.table_engines = table_engines;
         self
     }
 }
@@ -465,9 +606,39 @@ impl SchemaProvider for PaimonSchemaProvider {
         let schema_force_view_types = self.schema_force_view_types;
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
+        let table_engines: HashMap<String, Arc<dyn TableEngineResolver>> = self
+            .table_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         await_with_runtime(async move {
-            match catalog.get_table(&identifier).await {
-                Ok(mut table) => {
+            let non_paimon: HashSet<String> = table_engines.keys().cloned().collect();
+            match catalog.load_table_routing(&identifier, &non_paimon).await {
+                Ok(paimon::catalog::RoutedTableLoad::NonPaimon(declared)) => {
+                    if branch.is_some() {
+                        return Err(plan_datafusion_err!(
+                            "branches are not supported for '{}' tables ('{}')",
+                            declared,
+                            identifier.full_name()
+                        ));
+                    }
+                    let resolver = table_engines
+                        .get(&declared)
+                        .expect("declared type came from this engine map");
+                    let resolved = resolver
+                        .resolve_table(identifier.database(), identifier.object())
+                        .await?;
+                    // Read-only wrap: DML must not reach the engine provider.
+                    Ok(resolved.map(|inner| {
+                        Arc::new(ReadOnlyTableProvider {
+                            inner,
+                            declared,
+                            table_name: identifier.full_name(),
+                        }) as Arc<dyn TableProvider>
+                    }))
+                }
+                Ok(paimon::catalog::RoutedTableLoad::Paimon(table)) => {
+                    let mut table = *table;
                     if let Some(branch) = branch.as_deref() {
                         table = table
                             .copy_with_branch(branch)
@@ -524,7 +695,8 @@ impl SchemaProvider for PaimonSchemaProvider {
                             identifier.full_name()
                         )
                     })?;
-                    validate_view_dependencies(&catalog, &catalog_name, &view).await?;
+                    validate_view_dependencies(&catalog, &catalog_name, &view, &non_paimon)
+                        .await?;
                     let mut state = session_state
                         .and_then(|provider| provider())
                         .ok_or_else(|| {
@@ -606,15 +778,47 @@ impl SchemaProvider for PaimonSchemaProvider {
         let is_branches_table = object
             .system_table()
             .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
+        let has_system_suffix = object.system_table().is_some();
+        let engines: HashMap<String, Arc<dyn TableEngineResolver>> = self
+            .table_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         block_on_with_runtime(
             async move {
-                match catalog.get_table(&identifier).await {
-                    Ok(table) => {
+                let non_paimon: HashSet<String> = engines.keys().cloned().collect();
+                match catalog.load_table_routing(&identifier, &non_paimon).await {
+                    Ok(paimon::catalog::RoutedTableLoad::NonPaimon(declared)) => {
+                        // Branches and system tables are Paimon-only;
+                        // `table()` rejects them for routed tables.
+                        if branch.is_some() || has_system_suffix {
+                            return false;
+                        }
+                        match engines.get(&declared) {
+                            Some(resolver) => match resolver
+                                .resolve_table(identifier.database(), identifier.object())
+                                .await
+                            {
+                                Ok(table) => table.is_some(),
+                                // Report failures as existing so `table()`
+                                // surfaces the real error.
+                                Err(err) => {
+                                    log::warn!(
+                                        "failed to probe engine table existence for '{}': {err}",
+                                        identifier.full_name()
+                                    );
+                                    true
+                                }
+                            },
+                            None => false,
+                        }
+                    }
+                    Ok(paimon::catalog::RoutedTableLoad::Paimon(table)) => {
                         if let Some(branch) = branch.as_deref() {
                             if is_branches_table {
                                 return true;
                             }
-                            table.copy_with_branch(branch).await.is_ok()
+                            (*table).copy_with_branch(branch).await.is_ok()
                         } else {
                             true
                         }
@@ -712,6 +916,7 @@ async fn validate_view_dependencies(
     catalog: &Arc<dyn Catalog>,
     catalog_name: &str,
     root: &View,
+    non_paimon_types: &HashSet<String>,
 ) -> DFResult<()> {
     let mut queue = VecDeque::from([root.clone()]);
     let mut loaded = HashSet::from([root.identifier().clone()]);
@@ -721,7 +926,11 @@ async fn validate_view_dependencies(
         let candidates = view_relation_identifiers(&view, catalog_name)?;
         let mut view_dependencies = Vec::new();
         for identifier in candidates {
-            match catalog.get_table(&identifier).await {
+            // Routed non-Paimon tables count as existing dependencies.
+            match catalog
+                .load_table_routing(&identifier, non_paimon_types)
+                .await
+            {
                 Ok(_) => continue,
                 Err(paimon::Error::TableNotExist { .. })
                 | Err(paimon::Error::Unsupported { .. }) => {}

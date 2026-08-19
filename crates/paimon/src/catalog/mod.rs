@@ -265,6 +265,17 @@ use crate::api::PagedList;
 use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::Table;
 
+/// Outcome of [`Catalog::load_table_routing`].
+#[derive(Debug)]
+pub enum RoutedTableLoad {
+    /// The table was constructed as a Paimon table (boxed: `Table` is much
+    /// larger than the other variant).
+    Paimon(Box<Table>),
+    /// The declared table type matched `non_paimon_types`; construction was
+    /// skipped.
+    NonPaimon(String),
+}
+
 /// Catalog API for reading and writing metadata (databases, tables) in Paimon.
 ///
 /// Corresponds to [org.apache.paimon.catalog.Catalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/Catalog.java).
@@ -322,6 +333,25 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::DatabaseNotExist`] - database in identifier does not exist.
     /// * [`crate::Error::TableNotExist`] - table does not exist.
     async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
+
+    /// Load a table, or return only its declared type (the `type` table
+    /// option) when it matches one of `non_paimon_types` — skipping
+    /// construction and any token/FileIO I/O. One metadata round-trip
+    /// either way. The default implementation always constructs, for
+    /// catalogs without a table-type concept.
+    ///
+    /// # Errors
+    /// Same as [`Catalog::get_table`].
+    async fn load_table_routing(
+        &self,
+        identifier: &Identifier,
+        non_paimon_types: &std::collections::HashSet<String>,
+    ) -> Result<RoutedTableLoad> {
+        let _ = non_paimon_types;
+        Ok(RoutedTableLoad::Paimon(Box::new(
+            self.get_table(identifier).await?,
+        )))
+    }
 
     /// List table names in a database. System tables are not listed.
     ///

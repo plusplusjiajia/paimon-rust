@@ -73,6 +73,18 @@ const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
+
+/// Declared table types a Paimon reader cannot serve; the only types
+/// accepted for table-engine routing. The Java side loads these as
+/// metadata-only tables (e.g. `IcebergTable`).
+pub const NON_PAIMON_TABLE_TYPES: &[&str] = &["iceberg-table"];
+
+/// Whether `table_type` is one of [`NON_PAIMON_TABLE_TYPES`].
+pub fn is_non_paimon_table_type(table_type: &str) -> bool {
+    NON_PAIMON_TABLE_TYPES
+        .iter()
+        .any(|declared| table_type.eq_ignore_ascii_case(declared))
+}
 pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
 pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
@@ -628,6 +640,14 @@ impl<'a> CoreOptions<'a> {
         self.options
             .get(TABLE_TYPE_OPTION)
             .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
+            .unwrap_or(false)
+    }
+
+    /// Whether the declared table type is one of [`NON_PAIMON_TABLE_TYPES`].
+    pub fn is_non_paimon_table(&self) -> bool {
+        self.options
+            .get(TABLE_TYPE_OPTION)
+            .map(|value| is_non_paimon_table_type(value))
             .unwrap_or(false)
     }
 

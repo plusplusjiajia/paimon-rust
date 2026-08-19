@@ -1501,3 +1501,118 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
         paimon::Error::Unsupported { .. }
     ));
 }
+
+#[tokio::test]
+async fn test_load_table_routing_returns_non_paimon_for_declared_type() {
+    use paimon::catalog::RoutedTableLoad;
+    use std::collections::HashSet;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "ice_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "ice_t");
+    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    let routed = ctx
+        .catalog
+        .load_table_routing(&identifier, &non_paimon)
+        .await
+        .unwrap();
+    assert!(
+        matches!(routed, RoutedTableLoad::NonPaimon(ref declared) if declared == "iceberg-table"),
+        "{routed:?}"
+    );
+
+    // Not declared non-Paimon: falls through to Paimon construction.
+    let routed = ctx
+        .catalog
+        .load_table_routing(&identifier, &HashSet::new())
+        .await;
+    assert!(!matches!(routed, Ok(RoutedTableLoad::NonPaimon(_))));
+}
+
+#[tokio::test]
+async fn test_load_table_routing_fails_closed_on_query_auth() {
+    use std::collections::HashSet;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "authed_ice_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "authed_ice_t");
+    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    // Routing must fail closed on query-auth like every Paimon read.
+    let err = ctx
+        .catalog
+        .load_table_routing(&identifier, &non_paimon)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message } if message.contains("query-auth")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_routing_constructs_paimon_for_undeclared_type() {
+    use paimon::catalog::RoutedTableLoad;
+    use std::collections::HashSet;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "plain_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "plain_t");
+    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    let routed = ctx
+        .catalog
+        .load_table_routing(&identifier, &non_paimon)
+        .await
+        .unwrap();
+    match routed {
+        RoutedTableLoad::Paimon(table) => {
+            assert_eq!(table.identifier().full_name(), "default.plain_t");
+        }
+        other => panic!("expected a constructed Paimon table, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_get_table_fails_closed_on_iceberg_table() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "raw_ice_t", schema, "file:///unused");
+
+    // Raw get_table paths fail closed on non-Paimon tables; reads go through
+    // load_table_routing + an engine.
+    let err = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "raw_ice_t"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("cannot be read as a Paimon table")),
+        "{err:?}"
+    );
+}
