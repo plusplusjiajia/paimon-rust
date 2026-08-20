@@ -128,8 +128,8 @@ impl RESTEnv {
             .map_err(|e| map_rest_error_for_table(e, identifier))
     }
 
-    /// Build a Table from an already-fetched response, so type-routed
-    /// callers can inspect the declared type before constructing.
+    /// Build a Table from an already-fetched response, so routing can
+    /// inspect the declared type first.
     pub(crate) async fn build_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -155,10 +155,10 @@ impl RESTEnv {
             ),
             source: None,
         })?;
-        // Fail closed: constructing a non-Paimon table as Paimon would let raw
-        // `get_table` paths (writes, procedures, time travel) misread it.
-        if CoreOptions::new(schema.options()).is_non_paimon_table() {
-            let declared = schema.options().get("type").cloned().unwrap_or_default();
+        // Fail closed: constructed as Paimon, raw `get_table` paths (writes,
+        // procedures, time travel) would misread it.
+        let declared = CoreOptions::new(schema.options()).table_type()?;
+        if declared.requires_table_engine() {
             return Err(Error::Unsupported {
                 message: format!(
                     "table '{}' is declared '{declared}' and cannot be read as a Paimon \

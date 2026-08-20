@@ -262,18 +262,16 @@ impl fmt::Debug for Identifier {
 use async_trait::async_trait;
 
 use crate::api::PagedList;
-use crate::spec::{Partition, Schema, SchemaChange};
+use crate::spec::{Partition, Schema, SchemaChange, TableType};
 use crate::table::Table;
 
 /// Outcome of [`Catalog::load_table_routing`].
 #[derive(Debug)]
 pub enum RoutedTableLoad {
-    /// The table was constructed as a Paimon table (boxed: `Table` is much
-    /// larger than the other variant).
+    /// A constructed Paimon table (boxed: far larger than the other variant).
     Paimon(Box<Table>),
-    /// The declared table type matched `non_paimon_types`; construction was
-    /// skipped.
-    NonPaimon(String),
+    /// The declared type is in `engine_types`; construction was skipped.
+    Engine(TableType),
 }
 
 /// Catalog API for reading and writing metadata (databases, tables) in Paimon.
@@ -334,20 +332,19 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::TableNotExist`] - table does not exist.
     async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
 
-    /// Load a table, or return only its declared type (the `type` table
-    /// option) when it matches one of `non_paimon_types` — skipping
-    /// construction and any token/FileIO I/O. One metadata round-trip
-    /// either way. The default implementation always constructs, for
-    /// catalogs without a table-type concept.
+    /// Load a table, or return only its declared [`TableType`] when that
+    /// type is in `engine_types`, skipping construction and its token/FileIO
+    /// I/O. One metadata round-trip either way. The default implementation
+    /// always constructs, for catalogs without a table-type concept.
     ///
     /// # Errors
     /// Same as [`Catalog::get_table`].
     async fn load_table_routing(
         &self,
         identifier: &Identifier,
-        non_paimon_types: &std::collections::HashSet<String>,
+        engine_types: &std::collections::HashSet<TableType>,
     ) -> Result<RoutedTableLoad> {
-        let _ = non_paimon_types;
+        let _ = engine_types;
         Ok(RoutedTableLoad::Paimon(Box::new(
             self.get_table(identifier).await?,
         )))

@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::spec::TableType;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -74,18 +76,6 @@ const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
-/// Declared table types a Paimon reader cannot serve; the only types
-/// accepted for table-engine routing. The Java side loads these as
-/// metadata-only tables (e.g. `IcebergTable`).
-pub const NON_PAIMON_TABLE_TYPES: &[&str] = &["iceberg-table"];
-
-/// Whether `table_type` is one of [`NON_PAIMON_TABLE_TYPES`].
-pub fn is_non_paimon_table_type(table_type: &str) -> bool {
-    NON_PAIMON_TABLE_TYPES
-        .iter()
-        .any(|declared| table_type.eq_ignore_ascii_case(declared))
-}
-pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
 pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
@@ -636,19 +626,17 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
-    pub fn is_format_table(&self) -> bool {
-        self.options
-            .get(TABLE_TYPE_OPTION)
-            .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
-            .unwrap_or(false)
+    /// The declared [`TableType`], defaulting to [`TableType::Table`].
+    /// Fails on a value this client does not know.
+    pub fn table_type(&self) -> crate::Result<TableType> {
+        match self.options.get(TABLE_TYPE_OPTION) {
+            Some(value) => value.parse(),
+            None => Ok(TableType::default()),
+        }
     }
 
-    /// Whether the declared table type is one of [`NON_PAIMON_TABLE_TYPES`].
-    pub fn is_non_paimon_table(&self) -> bool {
-        self.options
-            .get(TABLE_TYPE_OPTION)
-            .map(|value| is_non_paimon_table_type(value))
-            .unwrap_or(false)
+    pub fn is_format_table(&self) -> bool {
+        matches!(self.table_type(), Ok(TableType::FormatTable))
     }
 
     pub fn path(&self) -> Option<&str> {

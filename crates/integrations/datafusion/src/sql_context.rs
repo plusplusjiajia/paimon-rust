@@ -353,13 +353,14 @@ impl SQLContext {
         self.catalogs.contains_key(name)
     }
 
-    /// Register an engine for a non-Paimon table type (the declared `type`
-    /// table option, e.g. `iceberg-table`) on a registered Paimon catalog.
+    /// Register an engine for a table type served by another engine (e.g.
+    /// [`paimon::spec::TableType::IcebergTable`]) on a registered Paimon
+    /// catalog.
     /// See [`crate::catalog::PaimonCatalogProvider::register_table_engine`].
     pub fn register_catalog_table_engine(
         &self,
         catalog_name: &str,
-        table_type: &str,
+        table_type: paimon::spec::TableType,
         resolver: Arc<dyn crate::catalog::TableEngineResolver>,
     ) -> DFResult<()> {
         let catalog_provider = self

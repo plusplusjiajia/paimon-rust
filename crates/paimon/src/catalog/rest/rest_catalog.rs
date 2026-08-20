@@ -218,18 +218,17 @@ impl Catalog for RESTCatalog {
     async fn load_table_routing(
         &self,
         identifier: &Identifier,
-        non_paimon_types: &std::collections::HashSet<String>,
+        engine_types: &std::collections::HashSet<crate::spec::TableType>,
     ) -> Result<crate::catalog::RoutedTableLoad> {
         let response = RESTEnv::fetch_table_response(identifier, &self.api).await?;
         if let Some(schema) = response.schema.as_ref() {
-            if let Some(declared) = schema.options().get("type") {
-                let declared = declared.to_ascii_lowercase();
-                if non_paimon_types.contains(&declared) {
-                    // Neither this client nor an engine resolver can enforce
-                    // the server-side row filter / column masking.
-                    crate::spec::CoreOptions::new(schema.options()).ensure_read_authorized()?;
-                    return Ok(crate::catalog::RoutedTableLoad::NonPaimon(declared));
-                }
+            let options = crate::spec::CoreOptions::new(schema.options());
+            let declared = options.table_type()?;
+            if engine_types.contains(&declared) {
+                // Neither this client nor an engine can enforce the
+                // server-side row filter / column mask.
+                options.ensure_read_authorized()?;
+                return Ok(crate::catalog::RoutedTableLoad::Engine(declared));
             }
         }
         RESTEnv::build_table(

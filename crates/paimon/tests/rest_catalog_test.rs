@@ -1503,8 +1503,9 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
 }
 
 #[tokio::test]
-async fn test_load_table_routing_returns_non_paimon_for_declared_type() {
+async fn test_load_table_routing_returns_engine_for_declared_type() {
     use paimon::catalog::RoutedTableLoad;
+    use paimon::spec::TableType;
     use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
@@ -1517,27 +1518,28 @@ async fn test_load_table_routing_returns_non_paimon_for_declared_type() {
         .add_table_with_schema("default", "ice_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "ice_t");
-    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    let engine_types = HashSet::from([TableType::IcebergTable]);
     let routed = ctx
         .catalog
-        .load_table_routing(&identifier, &non_paimon)
+        .load_table_routing(&identifier, &engine_types)
         .await
         .unwrap();
     assert!(
-        matches!(routed, RoutedTableLoad::NonPaimon(ref declared) if declared == "iceberg-table"),
+        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
         "{routed:?}"
     );
 
-    // Not declared non-Paimon: falls through to Paimon construction.
+    // No engine registered for the type: falls through to Paimon construction.
     let routed = ctx
         .catalog
         .load_table_routing(&identifier, &HashSet::new())
         .await;
-    assert!(!matches!(routed, Ok(RoutedTableLoad::NonPaimon(_))));
+    assert!(!matches!(routed, Ok(RoutedTableLoad::Engine(_))));
 }
 
 #[tokio::test]
 async fn test_load_table_routing_fails_closed_on_query_auth() {
+    use paimon::spec::TableType;
     use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
@@ -1551,11 +1553,11 @@ async fn test_load_table_routing_fails_closed_on_query_auth() {
         .add_table_with_schema("default", "authed_ice_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "authed_ice_t");
-    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    let engine_types = HashSet::from([TableType::IcebergTable]);
     // Routing must fail closed on query-auth like every Paimon read.
     let err = ctx
         .catalog
-        .load_table_routing(&identifier, &non_paimon)
+        .load_table_routing(&identifier, &engine_types)
         .await
         .unwrap_err();
     assert!(
@@ -1567,6 +1569,7 @@ async fn test_load_table_routing_fails_closed_on_query_auth() {
 #[tokio::test]
 async fn test_load_table_routing_constructs_paimon_for_undeclared_type() {
     use paimon::catalog::RoutedTableLoad;
+    use paimon::spec::TableType;
     use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
@@ -1578,10 +1581,10 @@ async fn test_load_table_routing_constructs_paimon_for_undeclared_type() {
         .add_table_with_schema("default", "plain_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "plain_t");
-    let non_paimon = HashSet::from(["iceberg-table".to_string()]);
+    let engine_types = HashSet::from([TableType::IcebergTable]);
     let routed = ctx
         .catalog
-        .load_table_routing(&identifier, &non_paimon)
+        .load_table_routing(&identifier, &engine_types)
         .await
         .unwrap();
     match routed {
@@ -1603,7 +1606,7 @@ async fn test_get_table_fails_closed_on_iceberg_table() {
     ctx.server
         .add_table_with_schema("default", "raw_ice_t", schema, "file:///unused");
 
-    // Raw get_table paths fail closed on non-Paimon tables; reads go through
+    // Raw get_table paths fail closed on engine-served tables; reads go through
     // load_table_routing + an engine.
     let err = ctx
         .catalog
@@ -1613,6 +1616,61 @@ async fn test_get_table_fails_closed_on_iceberg_table() {
     assert!(
         matches!(err, paimon::Error::Unsupported { ref message }
             if message.contains("cannot be read as a Paimon table")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_routing_parses_declared_type_case_insensitively() {
+    use paimon::catalog::RoutedTableLoad;
+    use paimon::spec::TableType;
+    use std::collections::HashSet;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "ICEBERG-TABLE")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "upper_ice_t", schema, "file:///unused");
+
+    let routed = ctx
+        .catalog
+        .load_table_routing(
+            &Identifier::new("default", "upper_ice_t"),
+            &HashSet::from([TableType::IcebergTable]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+        "{routed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_routing_rejects_unknown_declared_type() {
+    use std::collections::HashSet;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "delta-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "delta_t", schema, "file:///unused");
+
+    // A type this client does not know is not silently read as Paimon.
+    let err = ctx
+        .catalog
+        .load_table_routing(&Identifier::new("default", "delta_t"), &HashSet::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("unknown table type")),
         "{err:?}"
     );
 }
