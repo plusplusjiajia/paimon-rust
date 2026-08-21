@@ -430,8 +430,6 @@ async fn test_special_char_names() {
     assert!(cat.list_databases().await.unwrap().is_empty());
 }
 
-/// A table declared as an engine-served type stays describable over REST, so
-/// the client can route it instead of reading it as Paimon.
 #[tokio::test]
 async fn declared_engine_type_routes_through_the_rest_catalog() {
     use paimon::catalog::RoutedTableLoad;
@@ -465,7 +463,6 @@ async fn declared_engine_type_routes_through_the_rest_catalog() {
         "{routed:?}"
     );
 
-    // Raw get_table still fails closed on both sides of the wire.
     let err = ctx
         .catalog
         .get_table(&identifier)
@@ -475,4 +472,57 @@ async fn declared_engine_type_routes_through_the_rest_catalog() {
         err.to_string().contains("cannot be read as a Paimon table"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn creating_a_table_with_an_unknown_type_is_rejected() {
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .expect("create database");
+
+    let mut payload = serde_json::to_value(append_only_schema()).expect("serialize schema");
+    payload["options"]["type"] = serde_json::json!("iceberg-tabel");
+    let schema: Schema = serde_json::from_value(payload).expect("deserialize schema");
+    let identifier = Identifier::new("db", "typo_t");
+
+    ctx.catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .expect_err("a misspelled type must not create a table");
+    let tables = ctx.catalog.list_tables("db").await.expect("list tables");
+    assert!(!tables.contains(&"typo_t".to_string()), "{tables:?}");
+}
+
+#[tokio::test]
+async fn altering_the_declared_type_is_rejected() {
+    use paimon::spec::SchemaChange;
+
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .expect("create database");
+    let identifier = Identifier::new("db", "t");
+    ctx.catalog
+        .create_table(&identifier, append_only_schema(), false)
+        .await
+        .expect("create table");
+
+    ctx.catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(
+                "type".to_string(),
+                "iceberg-table".to_string(),
+            )],
+            false,
+        )
+        .await
+        .expect_err("changing 'type' over REST must be rejected");
+    ctx.catalog
+        .get_table(&identifier)
+        .await
+        .expect("still readable");
 }

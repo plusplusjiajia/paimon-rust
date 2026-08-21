@@ -925,6 +925,13 @@ impl<'a> CoreOptions<'a> {
     ///
     /// This is the semantic owner for selector mutual exclusion and strict
     /// numeric parsing.
+    /// Whether these options ask for a historical state of the table. A
+    /// malformed selector counts too, so callers that cannot honor time
+    /// travel reject rather than answer from the current state.
+    pub fn has_time_travel_selector(&self) -> bool {
+        !matches!(self.try_time_travel_selector(), Ok(None))
+    }
+
     pub(crate) fn try_time_travel_selector(&self) -> crate::Result<Option<TimeTravelSelector<'a>>> {
         let selectors = self.configured_time_travel_selectors();
         if selectors.len() > 1 {

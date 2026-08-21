@@ -416,8 +416,8 @@ async fn create_table(
 async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
     let table = path.get("table");
     let identifier = Identifier::new(path.get("db"), table.clone());
-    // Raw metadata, not a constructed table: engine-served types (e.g.
-    // `iceberg-table`) must still be describable so clients can route them.
+    // Raw metadata, not a constructed table: engine-served types must stay
+    // describable so clients can route them.
     let (location, loaded_schema) = match state.catalog.fetch_table_schema(&identifier).await {
         Ok(loaded) => loaded,
         Err(e) => return error_response(e),

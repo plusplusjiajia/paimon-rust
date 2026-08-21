@@ -22,6 +22,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
+use datafusion::common::plan_datafusion_err;
 use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::builder::LogicalPlanBuilder;
@@ -31,6 +32,7 @@ use datafusion::logical_expr::planner::{
 use datafusion::sql::sqlparser::ast::{self, TableFactor, TableVersion};
 use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
+use crate::catalog::ReadOnlyTableProvider;
 use crate::table::PaimonTableProvider;
 
 /// A [`RelationPlanner`] that intercepts `VERSION AS OF` and `TIMESTAMP AS OF`
@@ -85,6 +87,14 @@ impl RelationPlanner for PaimonRelationPlanner {
 
         // Check if this is a Paimon table.
         let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
+            if let Some(routed) = provider.downcast_ref::<ReadOnlyTableProvider>() {
+                // Falling through drops the version clause silently.
+                return Err(plan_datafusion_err!(
+                    "time travel is not supported for routed '{}' tables ('{}')",
+                    routed.declared,
+                    routed.table_name
+                ));
+            }
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 

@@ -53,11 +53,16 @@ impl TableType {
         }
     }
 
-    /// Whether the Paimon reader cannot serve this type, so it must be
-    /// routed to a table engine (see
+    /// Whether this type needs an engine of its own (see
     /// [`Catalog::load_table_routing`](crate::catalog::Catalog::load_table_routing)).
+    /// Java builds a dedicated table for each; this client has none, so
+    /// reading one as Paimon misreads it and writing could put Paimon
+    /// snapshots over foreign data.
     pub fn requires_table_engine(&self) -> bool {
-        matches!(self, TableType::IcebergTable)
+        matches!(
+            self,
+            TableType::ObjectTable | TableType::LanceTable | TableType::IcebergTable
+        )
     }
 }
 
@@ -119,14 +124,18 @@ mod tests {
     }
 
     #[test]
-    fn only_iceberg_requires_an_engine() {
-        assert!(TableType::IcebergTable.requires_table_engine());
+    fn types_without_a_paimon_reader_require_an_engine() {
+        for table_type in [
+            TableType::ObjectTable,
+            TableType::LanceTable,
+            TableType::IcebergTable,
+        ] {
+            assert!(table_type.requires_table_engine(), "{table_type}");
+        }
         for table_type in [
             TableType::Table,
             TableType::FormatTable,
             TableType::MaterializedTable,
-            TableType::ObjectTable,
-            TableType::LanceTable,
         ] {
             assert!(!table_type.requires_table_engine(), "{table_type}");
         }

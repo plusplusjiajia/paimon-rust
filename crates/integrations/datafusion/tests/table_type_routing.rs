@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Declared-type table routing: tables declared as a non-Paimon type (e.g.
-//! `iceberg-table`) resolve through the registered engine; everything else
-//! takes the Paimon path unchanged.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -38,8 +34,6 @@ use tempfile::TempDir;
 const CATALOG: &str = "cat";
 const DB: &str = "shared_db";
 
-/// A filesystem-backed catalog that declares table types the way a REST
-/// catalog does through the `type` table option.
 #[derive(Debug)]
 struct TypedTestCatalog {
     inner: Arc<FileSystemCatalog>,
@@ -79,7 +73,6 @@ impl Catalog for TypedTestCatalog {
     }
 
     async fn get_table(&self, identifier: &Identifier) -> PaimonResult<Table> {
-        // Mirror the REST catalog: engine-served tables fail closed.
         if let Some(declared) = self.declared_types.get(identifier.object()) {
             return Err(paimon::Error::Unsupported {
                 message: format!(
@@ -156,7 +149,6 @@ impl Catalog for TypedTestCatalog {
     }
 }
 
-/// A stand-in engine: serves a fixed two-row in-memory table for `it`.
 #[derive(Debug)]
 struct FakeEngineResolver;
 
@@ -188,14 +180,10 @@ impl TableEngineResolver for FakeEngineResolver {
 }
 
 struct TestEnv {
-    // Owns the warehouse directory for the duration of the test.
     _paimon_dir: TempDir,
     ctx: SQLContext,
 }
 
-/// One SQLContext with catalog `cat`: a Paimon table `cat.shared_db.pt`
-/// (two rows, two snapshots) plus a declared `iceberg-table`
-/// `cat.shared_db.it` routed to a fake engine.
 async fn setup() -> TestEnv {
     let paimon_dir = TempDir::new().unwrap();
     let warehouse = format!("file://{}", paimon_dir.path().display());
@@ -206,9 +194,7 @@ async fn setup() -> TestEnv {
         inner: fs_catalog,
         declared_types: HashMap::from([
             ("it".to_string(), TableType::IcebergTable),
-            // Unknown to the engine: existence mirrors the resolver's miss.
             ("ghost".to_string(), TableType::IcebergTable),
-            // Write-statement target: raw get_table paths fail closed.
             ("ft".to_string(), TableType::IcebergTable),
         ]),
     });
@@ -222,7 +208,6 @@ async fn setup() -> TestEnv {
     ))
     .await
     .unwrap();
-    // Two separate INSERTs -> two snapshots, so time travel has history.
     for stmt in [
         format!("INSERT INTO {CATALOG}.{DB}.pt VALUES (1, 'a')"),
         format!("INSERT INTO {CATALOG}.{DB}.pt VALUES (2, 'b')"),
@@ -275,7 +260,6 @@ async fn declared_engine_table_routes_to_engine() {
         .sql(&format!("SELECT id, payload FROM {CATALOG}.{DB}.it"))
         .await
         .unwrap();
-    // Schema comes from the engine — `payload` only exists there.
     let names: Vec<String> = df
         .schema()
         .fields()
@@ -301,7 +285,6 @@ async fn cross_engine_join_plans_and_runs() {
         .collect()
         .await
         .unwrap();
-    // pt has ids {1,2}; the engine table has {1,3}.
     assert_eq!(column_i32(&batches), vec![1]);
 }
 
@@ -322,8 +305,6 @@ async fn missing_table_still_errors() {
     );
 }
 
-// Downcast-based paths — time travel, temp tables — must keep working
-// with engines registered.
 #[tokio::test]
 async fn time_travel_still_works_with_engines_registered() {
     let env = setup().await;
@@ -335,7 +316,6 @@ async fn time_travel_still_works_with_engines_registered() {
         .collect()
         .await
         .unwrap();
-    // Snapshot 1 holds only the first INSERT.
     assert_eq!(column_i32(&batches), vec![1]);
 }
 
@@ -387,7 +367,6 @@ async fn table_names_come_from_the_catalog_listing() {
     assert!(names.contains(&"it".to_string()), "{names:?}");
 }
 
-// Engine failures surface as the engine's error, never as "not found".
 #[derive(Debug)]
 struct BrokenResolver;
 
@@ -421,9 +400,8 @@ async fn engine_errors_are_surfaced() {
     assert!(msg.contains("engine backend exploded"), "{msg}");
 }
 
-// A declared engine type with no registered engine takes the Paimon path.
 #[tokio::test]
-async fn undeclared_engine_type_takes_paimon_path() {
+async fn paimon_served_type_takes_paimon_path() {
     let paimon_dir = TempDir::new().unwrap();
     let warehouse = format!("file://{}", paimon_dir.path().display());
     let mut options = Options::new();
@@ -431,23 +409,20 @@ async fn undeclared_engine_type_takes_paimon_path() {
     let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
     let typed_catalog = Arc::new(TypedTestCatalog {
         inner: fs_catalog,
-        declared_types: HashMap::from([("ot".to_string(), TableType::ObjectTable)]),
+        declared_types: HashMap::from([("mt".to_string(), TableType::MaterializedTable)]),
     });
     let mut ctx = SQLContext::new();
     ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
     ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
         .await
         .unwrap();
-    // No engine registered at all: `ot` resolves through Paimon and fails as
-    // a plain missing table, exactly like before routing existed.
-    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.ot")).await else {
-        panic!("undeclared engine type must fall through to Paimon");
+    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.mt")).await else {
+        panic!("a Paimon-served type must fall through to Paimon");
     };
     let msg = err.to_string().to_lowercase();
-    assert!(msg.contains("ot") || msg.contains("not found"), "{msg}");
+    assert!(msg.contains("mt") || msg.contains("not found"), "{msg}");
 }
 
-// Write statements against routed tables must fail closed.
 #[tokio::test]
 async fn writes_to_routed_tables_fail_closed() {
     let env = setup().await;
@@ -463,7 +438,6 @@ async fn writes_to_routed_tables_fail_closed() {
     assert!(msg.contains(TableType::IcebergTable.as_str()), "{msg}");
 }
 
-// System tables are Paimon-only; routed tables get a clear error.
 #[tokio::test]
 async fn system_tables_on_routed_tables_error() {
     let env = setup().await;
@@ -478,7 +452,6 @@ async fn system_tables_on_routed_tables_error() {
     assert!(msg.contains("cannot be read as a Paimon table"), "{msg}");
 }
 
-// Existence mirrors resolution: engine hit -> true, miss -> false.
 #[tokio::test]
 async fn table_exist_mirrors_the_resolver() {
     let env = setup().await;
@@ -489,13 +462,12 @@ async fn table_exist_mirrors_the_resolver() {
     assert!(!schema.table_exist("it$snapshots"));
 }
 
-// Only table types the Paimon reader cannot serve may be routed.
 #[tokio::test]
 async fn paimon_managed_types_cannot_be_routed() {
     let env = setup().await;
     let Err(err) = env.ctx.register_catalog_table_engine(
         CATALOG,
-        TableType::LanceTable,
+        TableType::FormatTable,
         Arc::new(FakeEngineResolver),
     ) else {
         panic!("registering an engine for a Paimon-managed type must fail");
@@ -504,8 +476,6 @@ async fn paimon_managed_types_cannot_be_routed() {
     assert!(msg.contains("served by the Paimon reader"), "{msg}");
 }
 
-// DML against a routed table is rejected even when the engine's provider
-// is writable (the fake resolver returns a writable MemTable).
 #[tokio::test]
 async fn insert_into_routed_table_is_rejected() {
     let env = setup().await;
@@ -523,4 +493,130 @@ async fn insert_into_routed_table_is_rejected() {
             .contains("write is not supported for routed 'iceberg-table' tables"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn object_and_lance_tables_route_to_engines() {
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let typed_catalog = Arc::new(TypedTestCatalog {
+        inner: fs_catalog,
+        declared_types: HashMap::from([
+            ("it".to_string(), TableType::ObjectTable),
+            ("lt".to_string(), TableType::LanceTable),
+        ]),
+    });
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
+    ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
+        .await
+        .unwrap();
+    for declared in [TableType::ObjectTable, TableType::LanceTable] {
+        ctx.register_catalog_table_engine(CATALOG, declared, Arc::new(FakeEngineResolver))
+            .unwrap();
+    }
+
+    let batches = ctx
+        .sql(&format!("SELECT id FROM {CATALOG}.{DB}.it ORDER BY id"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_i32(&batches), vec![1, 3]);
+}
+
+#[tokio::test]
+async fn time_travel_on_routed_tables_is_rejected() {
+    let env = setup().await;
+    env.ctx
+        .ctx()
+        .sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let Err(err) = env
+        .ctx
+        .ctx()
+        .sql(&format!(
+            "SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 999999"
+        ))
+        .await
+    else {
+        panic!("time travel on a routed table must not silently read current data");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("time travel is not supported"), "{msg}");
+
+    let Err(err) = env
+        .ctx
+        .ctx()
+        .sql(&format!(
+            "SELECT * FROM {CATALOG}.{DB}.it TIMESTAMP AS OF '2020-01-01 00:00:00'"
+        ))
+        .await
+    else {
+        panic!("timestamp travel on a routed table must be rejected too");
+    };
+    assert!(
+        err.to_string().contains("time travel is not supported"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn session_time_travel_on_routed_tables_is_rejected() {
+    let env = setup().await;
+    env.ctx
+        .sql("SET 'paimon.scan.version' = '1'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let Err(err) = env
+        .ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+    else {
+        panic!("a session scan selector must not silently read current data");
+    };
+    assert!(
+        err.to_string().contains("time travel is not supported"),
+        "{err}"
+    );
+
+    env.ctx
+        .sql("RESET 'paimon.scan.version'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    env.ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+        .expect("routing works again once the selector is reset");
+
+    env.ctx
+        .sql("SET 'paimon.incremental-between' = '1,5'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let Err(err) = env
+        .ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+    else {
+        panic!("an unsupported scan option must not be silently ignored");
+    };
+    assert!(err.to_string().contains("incremental-between"), "{err}");
 }

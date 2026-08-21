@@ -65,10 +65,10 @@ pub trait TableEngineResolver: Debug + Send + Sync {
 /// Read-only wrapper around an engine-resolved provider: reads delegate,
 /// DML is rejected even when the engine's own provider is writable.
 #[derive(Debug)]
-struct ReadOnlyTableProvider {
+pub(crate) struct ReadOnlyTableProvider {
     inner: Arc<dyn TableProvider>,
-    declared: PaimonTableType,
-    table_name: String,
+    pub(crate) declared: PaimonTableType,
+    pub(crate) table_name: String,
 }
 
 #[async_trait]
@@ -615,6 +615,23 @@ impl SchemaProvider for PaimonSchemaProvider {
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
                             "branches are not supported for '{}' tables ('{}')",
+                            declared,
+                            identifier.full_name()
+                        ));
+                    }
+                    // The Paimon arm below applies these; an engine would
+                    // ignore them and answer from current data.
+                    let session_options = dynamic_options
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let session_options = paimon::spec::CoreOptions::new(&session_options);
+                    session_options
+                        .validate_scan_options()
+                        .map_err(to_datafusion_error)?;
+                    if session_options.has_time_travel_selector() {
+                        return Err(plan_datafusion_err!(
+                            "time travel is not supported for routed '{}' tables ('{}')",
                             declared,
                             identifier.full_name()
                         ));

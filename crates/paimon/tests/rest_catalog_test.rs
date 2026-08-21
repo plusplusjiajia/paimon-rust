@@ -1529,7 +1529,6 @@ async fn test_load_table_routing_returns_engine_for_declared_type() {
         "{routed:?}"
     );
 
-    // No engine registered for the type: falls through to Paimon construction.
     let routed = ctx
         .catalog
         .load_table_routing(&identifier, &HashSet::new())
@@ -1554,7 +1553,6 @@ async fn test_load_table_routing_fails_closed_on_query_auth() {
 
     let identifier = Identifier::new("default", "authed_ice_t");
     let engine_types = HashSet::from([TableType::IcebergTable]);
-    // Routing must fail closed on query-auth like every Paimon read.
     let err = ctx
         .catalog
         .load_table_routing(&identifier, &engine_types)
@@ -1606,8 +1604,6 @@ async fn test_get_table_fails_closed_on_iceberg_table() {
     ctx.server
         .add_table_with_schema("default", "raw_ice_t", schema, "file:///unused");
 
-    // Raw get_table paths fail closed on engine-served tables; reads go through
-    // load_table_routing + an engine.
     let err = ctx
         .catalog
         .get_table(&Identifier::new("default", "raw_ice_t"))
@@ -1654,15 +1650,16 @@ async fn test_load_table_routing_rejects_unknown_declared_type() {
     use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
-    let schema = Schema::builder()
+    let valid = Schema::builder()
         .column("id", DataType::BigInt(BigIntType::new()))
-        .option("type", "delta-table")
         .build()
         .unwrap();
+    let mut payload = serde_json::to_value(&valid).unwrap();
+    payload["options"] = serde_json::json!({ "type": "delta-table" });
+    let schema: Schema = serde_json::from_value(payload).unwrap();
     ctx.server
         .add_table_with_schema("default", "delta_t", schema, "file:///unused");
 
-    // A type this client does not know is not silently read as Paimon.
     let err = ctx
         .catalog
         .load_table_routing(&Identifier::new("default", "delta_t"), &HashSet::new())
