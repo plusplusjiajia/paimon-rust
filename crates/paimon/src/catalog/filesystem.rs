@@ -368,8 +368,11 @@ impl Catalog for FileSystemCatalog {
         if engine_types.contains(&declared) {
             // Neither this client nor an engine can enforce the
             // server-side row filter / column mask.
-            options.ensure_read_authorized()?;
-            return Ok(crate::catalog::RoutedTableLoad::Engine(declared));
+            return crate::catalog::RoutedTableLoad::engine(
+                declared,
+                &options,
+                &identifier.full_name(),
+            );
         }
         self.build_table(identifier, table_path, schema)
             .map(|table| crate::catalog::RoutedTableLoad::Paimon(Box::new(table)))
@@ -832,6 +835,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stored_scan_selectors_block_routing() {
+        use crate::catalog::RoutedTableLoad;
+        use std::collections::HashSet;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+
+        for (name, key, value) in [
+            ("ice_v", "scan.version", "1"),
+            ("ice_s", "scan.snapshot-id", "1"),
+            ("ice_i", "incremental-between", "1,5"),
+        ] {
+            let schema = Schema::builder()
+                .column(
+                    "id",
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                )
+                .option("type", "iceberg-table")
+                .option(key, value)
+                .build()
+                .unwrap();
+            let identifier = Identifier::new("db1", name);
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+
+            let err = catalog
+                .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{key}: {err:?}");
+        }
+
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "ice_plain");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        let routed = catalog
+            .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
+            .await
+            .unwrap();
+        assert!(matches!(routed, RoutedTableLoad::Engine(_)), "{routed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_routing_cannot_skip_the_read_guards() {
+        use crate::catalog::RoutedTableLoad;
+        use crate::spec::CoreOptions;
+
+        // The only constructor of the `Engine` variant, so a third-party
+        // catalog cannot route past these guards either.
+        for (key, value) in [
+            ("query-auth.enabled", "true"),
+            ("scan.version", "1"),
+            ("incremental-between", "1,5"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            let err = RoutedTableLoad::engine(
+                TableType::IcebergTable,
+                &CoreOptions::new(&options),
+                "db1.t",
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{key}: {err:?}");
+        }
+
+        let options = HashMap::new();
+        assert!(RoutedTableLoad::engine(
+            TableType::IcebergTable,
+            &CoreOptions::new(&options),
+            "db1.t",
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn test_types_without_a_paimon_reader_fail_closed() {
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -892,7 +984,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+            matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
             "{routed:?}"
         );
 

@@ -271,7 +271,36 @@ pub enum RoutedTableLoad {
     /// A constructed Paimon table (boxed: far larger than the other variant).
     Paimon(Box<Table>),
     /// The declared type is in `engine_types`; construction was skipped.
-    Engine(TableType),
+    Engine(EngineTable),
+}
+
+/// A table handed to a registered engine. Only [`RoutedTableLoad::engine`]
+/// can build one, so no catalog — including a third-party implementation —
+/// routes a table without the checks that constructor performs.
+#[derive(Debug)]
+pub struct EngineTable {
+    declared: TableType,
+}
+
+impl EngineTable {
+    /// The type the table's metadata declares.
+    pub fn declared(&self) -> TableType {
+        self.declared
+    }
+}
+
+impl RoutedTableLoad {
+    /// Route `full_name` to the engine registered for `declared`, refusing
+    /// what [`CoreOptions::ensure_engine_can_serve`](crate::spec::CoreOptions::ensure_engine_can_serve)
+    /// refuses.
+    pub fn engine(
+        declared: TableType,
+        options: &crate::spec::CoreOptions<'_>,
+        full_name: &str,
+    ) -> Result<Self> {
+        options.ensure_engine_can_serve(full_name)?;
+        Ok(Self::Engine(EngineTable { declared }))
+    }
 }
 
 /// Catalog API for reading and writing metadata (databases, tables) in Paimon.

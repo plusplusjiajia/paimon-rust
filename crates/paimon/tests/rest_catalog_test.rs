@@ -1525,7 +1525,7 @@ async fn test_load_table_routing_returns_engine_for_declared_type() {
         .await
         .unwrap();
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
 
@@ -1640,7 +1640,7 @@ async fn test_load_table_routing_parses_declared_type_case_insensitively() {
         .await
         .unwrap();
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
 }

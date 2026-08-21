@@ -459,7 +459,7 @@ async fn declared_engine_type_routes_through_the_rest_catalog() {
         .await
         .expect("routing must reach the declared type");
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
 

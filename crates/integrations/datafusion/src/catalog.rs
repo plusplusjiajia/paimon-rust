@@ -29,6 +29,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::prelude::SessionContext;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -48,17 +49,41 @@ pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Se
 /// providers, so registrations stay visible to schemas obtained earlier.
 type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
 
+/// What an engine is asked to resolve. Non-exhaustive so later releases can
+/// carry more of the request — a snapshot selector, say — without breaking
+/// existing resolvers.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EngineTableRequest {
+    /// Database holding the table.
+    pub database: String,
+    /// Table name.
+    pub table: String,
+    /// The type the table's metadata declares.
+    pub declared: PaimonTableType,
+}
+
+impl EngineTableRequest {
+    /// A request for `database.table`, declared as `declared`.
+    pub fn new(database: String, table: String, declared: PaimonTableType) -> Self {
+        Self {
+            database,
+            table,
+            declared,
+        }
+    }
+}
+
 /// Resolves tables owned by another engine (see
 /// [`PaimonCatalogProvider::register_table_engine`]). `Ok(None)` means not
 /// found; errors propagate, so an engine failure never looks like a missing
 /// table.
 #[async_trait]
 pub trait TableEngineResolver: Debug + Send + Sync {
-    /// Resolve `database.table` to the engine's table provider.
+    /// Resolve a request to the engine's table provider.
     async fn resolve_table(
         &self,
-        database: &str,
-        table: &str,
+        request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>>;
 }
 
@@ -132,11 +157,47 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 }
 
+/// Register `resolver` as the engine for `table_type` on the Paimon catalog
+/// named `catalog_name`.
+///
+/// Also installs [`PaimonRelationPlanner`](crate::PaimonRelationPlanner) on
+/// `ctx`. Without it DataFusion drops `VERSION`/`TIMESTAMP AS OF` before this
+/// crate sees the query, and a historical read of a routed table would return
+/// current data; installing it here makes that impossible to forget.
+/// [`SQLContext`](crate::SQLContext) already installs the planner, and its own
+/// `register_catalog_table_engine` is equivalent to this.
+pub fn register_catalog_table_engine(
+    ctx: &SessionContext,
+    catalog_name: &str,
+    table_type: PaimonTableType,
+    resolver: Arc<dyn TableEngineResolver>,
+) -> DFResult<()> {
+    ctx.register_relation_planner(Arc::new(crate::PaimonRelationPlanner::new()))?;
+    let provider = ctx
+        .catalog(catalog_name)
+        .ok_or_else(|| plan_datafusion_err!("Unknown catalog '{catalog_name}'"))?;
+    provider
+        .downcast_ref::<PaimonCatalogProvider>()
+        .ok_or_else(|| plan_datafusion_err!("Catalog '{catalog_name}' is not a Paimon catalog"))?
+        .register_table_engine(table_type, resolver)
+}
+
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
 ///
 /// This provider uses lazy loading - databases and tables are fetched
 /// on-demand from the catalog, ensuring data is always fresh.
+///
+/// # Table-version clauses
+///
+/// SQL queries using `VERSION`/`TIMESTAMP AS OF` need
+/// [`PaimonRelationPlanner`](crate::PaimonRelationPlanner) installed on the
+/// session; DataFusion's default planner drops the clause before this crate
+/// sees it, so the query would read current data. [`SQLContext`](crate::SQLContext)
+/// installs it, as does
+/// [`register_catalog_table_engine`]. A plain `SessionContext` querying Paimon
+/// tables directly must install it with
+/// `ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))`.
 pub struct PaimonCatalogProvider {
     catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
@@ -201,7 +262,7 @@ impl PaimonCatalogProvider {
     /// Paimon path unchanged. Kept inside the provider so the registered
     /// catalog type never changes and downcast-based paths (temp tables,
     /// time travel) keep working.
-    pub fn register_table_engine(
+    pub(crate) fn register_table_engine(
         &self,
         table_type: PaimonTableType,
         resolver: Arc<dyn TableEngineResolver>,
@@ -611,7 +672,8 @@ impl SchemaProvider for PaimonSchemaProvider {
         await_with_runtime(async move {
             let engine_types: HashSet<PaimonTableType> = table_engines.keys().copied().collect();
             match catalog.load_table_routing(&identifier, &engine_types).await {
-                Ok(paimon::catalog::RoutedTableLoad::Engine(declared)) => {
+                Ok(paimon::catalog::RoutedTableLoad::Engine(engine)) => {
+                    let declared = engine.declared();
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
                             "branches are not supported for '{}' tables ('{}')",
@@ -625,22 +687,18 @@ impl SchemaProvider for PaimonSchemaProvider {
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    let session_options = paimon::spec::CoreOptions::new(&session_options);
-                    session_options
-                        .validate_scan_options()
+                    paimon::spec::CoreOptions::new(&session_options)
+                        .ensure_engine_can_serve(&identifier.full_name())
                         .map_err(to_datafusion_error)?;
-                    if session_options.has_time_travel_selector() {
-                        return Err(plan_datafusion_err!(
-                            "time travel is not supported for routed '{}' tables ('{}')",
-                            declared,
-                            identifier.full_name()
-                        ));
-                    }
                     let resolver = table_engines
                         .get(&declared)
                         .expect("declared type came from this engine map");
                     let resolved = resolver
-                        .resolve_table(identifier.database(), identifier.object())
+                        .resolve_table(&EngineTableRequest::new(
+                            identifier.database().to_string(),
+                            identifier.object().to_string(),
+                            declared,
+                        ))
                         .await?;
                     // Read-only wrap: DML must not reach the engine provider.
                     Ok(resolved.map(|inner| {
@@ -802,14 +860,19 @@ impl SchemaProvider for PaimonSchemaProvider {
             async move {
                 let engine_types: HashSet<PaimonTableType> = engines.keys().copied().collect();
                 match catalog.load_table_routing(&identifier, &engine_types).await {
-                    Ok(paimon::catalog::RoutedTableLoad::Engine(declared)) => {
+                    Ok(paimon::catalog::RoutedTableLoad::Engine(engine)) => {
+                        let declared = engine.declared();
                         // Paimon-only; `table()` rejects them here too.
                         if branch.is_some() || has_system_suffix {
                             return false;
                         }
                         match engines.get(&declared) {
                             Some(resolver) => match resolver
-                                .resolve_table(identifier.database(), identifier.object())
+                                .resolve_table(&EngineTableRequest::new(
+                                    identifier.database().to_string(),
+                                    identifier.object().to_string(),
+                                    declared,
+                                ))
                                 .await
                             {
                                 Ok(table) => table.is_some(),

@@ -925,6 +925,26 @@ impl<'a> CoreOptions<'a> {
     ///
     /// This is the semantic owner for selector mutual exclusion and strict
     /// numeric parsing.
+    /// Fails when these options forbid the read outright, or ask for
+    /// something a table engine cannot honor: a scan option this client does
+    /// not support, or a historical state. Dropping any of them would answer
+    /// with unfiltered or current data instead.
+    ///
+    /// Both the table's stored options and a session's options go through
+    /// here, so neither source can skip a check the other applies.
+    pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
+        self.ensure_read_authorized()?;
+        self.validate_scan_options()?;
+        if self.has_time_travel_selector() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "time travel is not supported for engine-served table '{full_name}'"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Whether these options ask for a historical state of the table. A
     /// malformed selector counts too, so callers that cannot honor time
     /// travel reject rather than answer from the current state.

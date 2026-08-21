@@ -28,7 +28,7 @@ use paimon::catalog::{Catalog, Database, Identifier, RoutedTableLoad};
 use paimon::spec::{Schema as PaimonSchema, SchemaChange, TableType};
 use paimon::table::Table;
 use paimon::{CatalogOptions, FileSystemCatalog, Options, Result as PaimonResult};
-use paimon_datafusion::{SQLContext, TableEngineResolver};
+use paimon_datafusion::{EngineTableRequest, SQLContext, TableEngineResolver};
 use tempfile::TempDir;
 
 const CATALOG: &str = "cat";
@@ -91,7 +91,12 @@ impl Catalog for TypedTestCatalog {
     ) -> PaimonResult<RoutedTableLoad> {
         if let Some(declared) = self.declared_types.get(identifier.object()) {
             if engine_types.contains(declared) {
-                return Ok(RoutedTableLoad::Engine(*declared));
+                let options = HashMap::new();
+                return RoutedTableLoad::engine(
+                    *declared,
+                    &paimon::spec::CoreOptions::new(&options),
+                    &identifier.full_name(),
+                );
             }
         }
         Ok(RoutedTableLoad::Paimon(Box::new(
@@ -156,10 +161,9 @@ struct FakeEngineResolver;
 impl TableEngineResolver for FakeEngineResolver {
     async fn resolve_table(
         &self,
-        _database: &str,
-        table: &str,
+        request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        if table != "it" {
+        if request.table != "it" {
             return Ok(None);
         }
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -374,8 +378,7 @@ struct BrokenResolver;
 impl TableEngineResolver for BrokenResolver {
     async fn resolve_table(
         &self,
-        _database: &str,
-        _table: &str,
+        _request: &EngineTableRequest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         Err(DataFusionError::Execution(
             "engine backend exploded".to_string(),
@@ -619,4 +622,138 @@ async fn session_time_travel_on_routed_tables_is_rejected() {
         panic!("an unsupported scan option must not be silently ignored");
     };
     assert!(err.to_string().contains("incremental-between"), "{err}");
+}
+
+#[tokio::test]
+async fn every_version_clause_on_routed_tables_is_rejected() {
+    let env = setup().await;
+    env.ctx
+        .ctx()
+        .sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for clause in [
+        "VERSION AS OF 999999",
+        "TIMESTAMP AS OF '2020-01-01 00:00:00'",
+        "FOR SYSTEM_TIME AS OF '2020-01-01 00:00:00'",
+    ] {
+        let Err(err) = env
+            .ctx
+            .ctx()
+            .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it {clause}"))
+            .await
+        else {
+            panic!("{clause} must not silently read current data");
+        };
+        assert!(
+            err.to_string().contains("time travel is not supported"),
+            "{clause}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn show_create_on_routed_tables_reports_the_declared_type() {
+    let env = setup().await;
+    let Err(err) = env
+        .ctx
+        .sql(&format!("SHOW CREATE TABLE {CATALOG}.{DB}.it"))
+        .await
+    else {
+        panic!("Paimon DDL would misrepresent an engine-served table");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("iceberg-table"), "{msg}");
+    assert!(msg.contains("cannot be read as a Paimon table"), "{msg}");
+}
+
+#[tokio::test]
+async fn session_query_auth_blocks_routed_reads() {
+    let env = setup().await;
+    env.ctx
+        .sql("SET 'paimon.query-auth.enabled' = 'true'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let Err(err) = env
+        .ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+    else {
+        panic!("query-auth must block a routed read, not just a Paimon one");
+    };
+    assert!(err.to_string().contains("query-auth"), "{err}");
+
+    env.ctx
+        .sql("RESET 'paimon.query-auth.enabled'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    env.ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+        .expect("routing works again once the flag is reset");
+}
+
+#[tokio::test]
+async fn registering_on_a_raw_session_installs_the_planner() {
+    use datafusion::prelude::SessionContext;
+    use paimon_datafusion::{register_catalog_table_engine, PaimonCatalogProvider};
+
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
+    let typed_catalog = Arc::new(TypedTestCatalog {
+        inner: fs_catalog,
+        declared_types: HashMap::from([("it".to_string(), TableType::IcebergTable)]),
+    });
+
+    // No SQLContext: the raw path a caller might take.
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        CATALOG,
+        Arc::new(PaimonCatalogProvider::new(
+            Some(CATALOG.to_string()),
+            typed_catalog,
+            Default::default(),
+            Default::default(),
+            None,
+        )),
+    );
+    register_catalog_table_engine(
+        &ctx,
+        CATALOG,
+        TableType::IcebergTable,
+        Arc::new(FakeEngineResolver),
+    )
+    .unwrap();
+    ctx.sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let Err(err) = ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it VERSION AS OF 1"))
+        .await
+    else {
+        panic!("registration must install the planner, so this cannot read current data");
+    };
+    assert!(err.to_string().contains("not supported"), "{err}");
 }

@@ -227,8 +227,11 @@ impl Catalog for RESTCatalog {
             if engine_types.contains(&declared) {
                 // Neither this client nor an engine can enforce the
                 // server-side row filter / column mask.
-                options.ensure_read_authorized()?;
-                return Ok(crate::catalog::RoutedTableLoad::Engine(declared));
+                return crate::catalog::RoutedTableLoad::engine(
+                    declared,
+                    &options,
+                    &identifier.full_name(),
+                );
             }
         }
         RESTEnv::build_table(

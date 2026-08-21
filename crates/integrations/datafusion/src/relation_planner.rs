@@ -72,10 +72,8 @@ impl RelationPlanner for PaimonRelationPlanner {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        let extra_options = match version {
-            Some(TableVersion::VersionAsOf(expr)) => resolve_version_as_of(expr)?,
-            Some(TableVersion::TimestampAsOf(expr)) => resolve_timestamp_as_of(expr)?,
-            _ => return Ok(RelationPlanning::Original(Box::new(relation))),
+        let Some(version) = version else {
+            return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
         // Resolve the table reference.
@@ -85,16 +83,24 @@ impl RelationPlanner for PaimonRelationPlanner {
             .get_table_source(table_ref.clone())?;
         let provider = source_as_provider(&source)?;
 
+        // Every version clause, not just the two resolved below: falling
+        // through drops the clause silently.
+        if let Some(routed) = provider.downcast_ref::<ReadOnlyTableProvider>() {
+            return Err(plan_datafusion_err!(
+                "time travel is not supported for routed '{}' tables ('{}')",
+                routed.declared,
+                routed.table_name
+            ));
+        }
+
+        let extra_options = match version {
+            TableVersion::VersionAsOf(expr) => resolve_version_as_of(expr)?,
+            TableVersion::TimestampAsOf(expr) => resolve_timestamp_as_of(expr)?,
+            _ => return Ok(RelationPlanning::Original(Box::new(relation))),
+        };
+
         // Check if this is a Paimon table.
         let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
-            if let Some(routed) = provider.downcast_ref::<ReadOnlyTableProvider>() {
-                // Falling through drops the version clause silently.
-                return Err(plan_datafusion_err!(
-                    "time travel is not supported for routed '{}' tables ('{}')",
-                    routed.declared,
-                    routed.table_name
-                ));
-            }
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
