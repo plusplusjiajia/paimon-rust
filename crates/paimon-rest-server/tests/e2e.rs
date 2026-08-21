@@ -429,3 +429,50 @@ async fn test_special_char_names() {
     cat.drop_database(plus_db, false, false).await.unwrap();
     assert!(cat.list_databases().await.unwrap().is_empty());
 }
+
+/// A table declared as an engine-served type stays describable over REST, so
+/// the client can route it instead of reading it as Paimon.
+#[tokio::test]
+async fn declared_engine_type_routes_through_the_rest_catalog() {
+    use paimon::catalog::RoutedTableLoad;
+    use paimon::spec::TableType;
+    use std::collections::HashSet;
+
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .expect("create database");
+
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("type", "iceberg-table")
+        .build()
+        .expect("build schema");
+    let identifier = Identifier::new("db", "ice_t");
+    ctx.catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .expect("create table");
+
+    let routed = ctx
+        .catalog
+        .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
+        .await
+        .expect("routing must reach the declared type");
+    assert!(
+        matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+        "{routed:?}"
+    );
+
+    // Raw get_table still fails closed on both sides of the wire.
+    let err = ctx
+        .catalog
+        .get_table(&identifier)
+        .await
+        .expect_err("an engine-served table must not construct as Paimon");
+    assert!(
+        err.to_string().contains("cannot be read as a Paimon table"),
+        "{err}"
+    );
+}

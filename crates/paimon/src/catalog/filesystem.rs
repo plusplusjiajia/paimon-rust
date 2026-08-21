@@ -26,7 +26,7 @@ use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::create_local_cache;
 use crate::io::FileIO;
-use crate::spec::{Schema, TableSchema};
+use crate::spec::{CoreOptions, Schema, TableSchema, TableType};
 use crate::table::{SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -170,6 +170,63 @@ impl FileSystemCatalog {
         Ok(dirs)
     }
 
+    /// Fetch the stored path and schema of an existing table, bypassing the
+    /// engine-type guard in [`Self::build_table`]. Routing inspects the
+    /// declared type through this, and a catalog server must keep serving raw
+    /// metadata for engine-served types so its clients can route them.
+    pub async fn fetch_table_schema(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<(String, TableSchema)> {
+        identifier.validate()?;
+
+        let table_path = self.table_path(identifier);
+
+        if !self.table_exists(identifier).await? {
+            return Err(Error::TableNotExist {
+                full_name: identifier.full_name(),
+            });
+        }
+
+        let schema = self
+            .load_latest_table_schema(&table_path)
+            .await?
+            .ok_or_else(|| Error::TableNotExist {
+                full_name: identifier.full_name(),
+            })?;
+
+        Ok((table_path, schema))
+    }
+
+    /// Build a Table from an already-fetched schema.
+    fn build_table(
+        &self,
+        identifier: &Identifier,
+        table_path: String,
+        schema: TableSchema,
+    ) -> Result<Table> {
+        // Fail closed: constructed as Paimon, raw `get_table` paths (writes,
+        // procedures, time travel) would misread it.
+        let declared = CoreOptions::new(schema.options()).table_type()?;
+        if declared.requires_table_engine() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{}' is declared '{declared}' and cannot be read as a Paimon \
+                     table; only plain reads through a registered table engine are supported",
+                    identifier.full_name()
+                ),
+            });
+        }
+
+        Ok(Table::new(
+            self.file_io.clone(),
+            identifier.clone(),
+            table_path,
+            schema,
+            None,
+        ))
+    }
+
     /// Load the latest schema for a table (highest schema-{version} file under table_path/schema).
     async fn load_latest_table_schema(&self, table_path: &str) -> Result<Option<TableSchema>> {
         let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
@@ -297,30 +354,26 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
-        identifier.validate()?;
+        let (table_path, schema) = self.fetch_table_schema(identifier).await?;
+        self.build_table(identifier, table_path, schema)
+    }
 
-        let table_path = self.table_path(identifier);
-
-        if !self.table_exists(identifier).await? {
-            return Err(Error::TableNotExist {
-                full_name: identifier.full_name(),
-            });
+    async fn load_table_routing(
+        &self,
+        identifier: &Identifier,
+        engine_types: &std::collections::HashSet<TableType>,
+    ) -> Result<crate::catalog::RoutedTableLoad> {
+        let (table_path, schema) = self.fetch_table_schema(identifier).await?;
+        let options = CoreOptions::new(schema.options());
+        let declared = options.table_type()?;
+        if engine_types.contains(&declared) {
+            // Neither this client nor an engine can enforce the
+            // server-side row filter / column mask.
+            options.ensure_read_authorized()?;
+            return Ok(crate::catalog::RoutedTableLoad::Engine(declared));
         }
-
-        let schema = self
-            .load_latest_table_schema(&table_path)
-            .await?
-            .ok_or_else(|| Error::TableNotExist {
-                full_name: identifier.full_name(),
-            })?;
-
-        Ok(Table::new(
-            self.file_io.clone(),
-            identifier.clone(),
-            table_path,
-            schema,
-            None,
-        ))
+        self.build_table(identifier, table_path, schema)
+            .map(|table| crate::catalog::RoutedTableLoad::Paimon(Box::new(table)))
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
@@ -663,6 +716,57 @@ mod tests {
 
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
         assert!(escaped_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_declared_engine_type_routes_and_fails_closed() {
+        use crate::catalog::RoutedTableLoad;
+        use std::collections::HashSet;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "ice_t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        // Routed to the engine, exactly like the REST catalog does.
+        let routed = catalog
+            .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(routed, RoutedTableLoad::Engine(TableType::IcebergTable)),
+            "{routed:?}"
+        );
+
+        // Raw get_table fails closed, so writes cannot reach a Paimon writer.
+        let err = catalog.get_table(&identifier).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { ref message }
+                if message.contains("cannot be read as a Paimon table")),
+            "{err:?}"
+        );
+
+        // No engine registered for the type: still fails closed rather than
+        // silently reading it as Paimon.
+        let err = catalog
+            .load_table_routing(&identifier, &HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
     }
 
     #[tokio::test]
