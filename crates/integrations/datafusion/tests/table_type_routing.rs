@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use paimon::catalog::{Catalog, Database, Identifier, RoutedTableLoad};
+use paimon::catalog::{Catalog, Database, Identifier, LoadedTable};
 use paimon::spec::{Schema as PaimonSchema, SchemaChange, TableType};
 use paimon::table::Table;
 use paimon::{CatalogOptions, FileSystemCatalog, Options, Result as PaimonResult};
@@ -84,22 +84,18 @@ impl Catalog for TypedTestCatalog {
         self.inner.get_table(identifier).await
     }
 
-    async fn load_table_routing(
-        &self,
-        identifier: &Identifier,
-        engine_types: &HashSet<TableType>,
-    ) -> PaimonResult<RoutedTableLoad> {
+    async fn load_table(&self, identifier: &Identifier) -> PaimonResult<LoadedTable> {
         if let Some(declared) = self.declared_types.get(identifier.object()) {
-            if engine_types.contains(declared) {
+            if declared.requires_table_engine() {
                 let options = HashMap::new();
-                return RoutedTableLoad::engine(
+                return LoadedTable::external(
                     *declared,
                     &paimon::spec::CoreOptions::new(&options),
                     &identifier.full_name(),
                 );
             }
         }
-        Ok(RoutedTableLoad::Paimon(Box::new(
+        Ok(LoadedTable::Paimon(Box::new(
             self.get_table(identifier).await?,
         )))
     }
@@ -756,4 +752,29 @@ async fn registering_on_a_raw_session_installs_the_planner() {
         panic!("registration must install the planner, so this cannot read current data");
     };
     assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+#[tokio::test]
+async fn an_external_type_without_an_engine_says_so() {
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let typed_catalog = Arc::new(TypedTestCatalog {
+        inner: fs_catalog,
+        declared_types: HashMap::from([("it".to_string(), TableType::IcebergTable)]),
+    });
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
+    ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
+        .await
+        .unwrap();
+
+    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.it")).await else {
+        panic!("an external table without an engine must not resolve");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("no table engine is registered"), "{msg}");
+    assert!(msg.contains("iceberg-table"), "{msg}");
 }

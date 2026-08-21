@@ -54,10 +54,10 @@ impl TableType {
     }
 
     /// Whether this type needs an engine of its own (see
-    /// [`Catalog::load_table_routing`](crate::catalog::Catalog::load_table_routing)).
-    /// Java builds a dedicated table for each; this client has none, so
-    /// reading one as Paimon misreads it and writing could put Paimon
-    /// snapshots over foreign data.
+    /// [`Catalog::load_table`](crate::catalog::Catalog::load_table)). Java
+    /// builds a dedicated table for each; this client has none, so reading one
+    /// as Paimon misreads it and writing could put Paimon snapshots over
+    /// foreign data.
     pub fn requires_table_engine(&self) -> bool {
         matches!(
             self,

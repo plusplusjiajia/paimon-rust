@@ -265,41 +265,51 @@ use crate::api::PagedList;
 use crate::spec::{Partition, Schema, SchemaChange, TableType};
 use crate::table::Table;
 
-/// Outcome of [`Catalog::load_table_routing`].
+/// Outcome of [`Catalog::load_table`].
 #[derive(Debug)]
-pub enum RoutedTableLoad {
+pub enum LoadedTable {
     /// A constructed Paimon table (boxed: far larger than the other variant).
     Paimon(Box<Table>),
-    /// The declared type is in `engine_types`; construction was skipped.
-    Engine(EngineTable),
+    /// A table this reader cannot construct.
+    External(ExternalTableMetadata),
 }
 
-/// A table handed to a registered engine. Only [`RoutedTableLoad::engine`]
-/// can build one, so no catalog — including a third-party implementation —
-/// routes a table without the checks that constructor performs.
+/// What a caller needs to pick an engine for a table Paimon cannot construct.
+/// Only [`LoadedTable::external`] can build one, so the stored-metadata checks
+/// always run before a caller sees it.
 #[derive(Debug)]
-pub struct EngineTable {
+pub struct ExternalTableMetadata {
     declared: TableType,
 }
 
-impl EngineTable {
+impl ExternalTableMetadata {
     /// The type the table's metadata declares.
     pub fn declared(&self) -> TableType {
         self.declared
     }
 }
 
-impl RoutedTableLoad {
-    /// Route `full_name` to the engine registered for `declared`, refusing
-    /// what [`CoreOptions::ensure_engine_can_serve`](crate::spec::CoreOptions::ensure_engine_can_serve)
-    /// refuses.
-    pub fn engine(
+impl LoadedTable {
+    /// Classify `full_name` as external, refusing options no engine can honor
+    /// and reads this client cannot authorize.
+    ///
+    /// Errors if [`TableType::requires_table_engine`] rejects `declared`:
+    /// classifying a Paimon-served type as external would skip the reader that
+    /// can actually construct it.
+    pub fn external(
         declared: TableType,
         options: &crate::spec::CoreOptions<'_>,
         full_name: &str,
     ) -> Result<Self> {
+        if !declared.requires_table_engine() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{full_name}' is declared '{declared}', which the Paimon reader serves"
+                ),
+            });
+        }
         options.ensure_engine_can_serve(full_name)?;
-        Ok(Self::Engine(EngineTable { declared }))
+        Ok(Self::External(ExternalTableMetadata { declared }))
     }
 }
 
@@ -361,20 +371,16 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::TableNotExist`] - table does not exist.
     async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
 
-    /// Load a table, or return only its declared [`TableType`] when that
-    /// type is in `engine_types`, skipping construction and its token/FileIO
-    /// I/O. One metadata round-trip either way. The default implementation
-    /// always constructs, for catalogs without a table-type concept.
+    /// Load a table, or classify it as [`LoadedTable::External`] when this
+    /// reader cannot construct it. One metadata round-trip either way, and the
+    /// outcome depends only on the table's own metadata. The default
+    /// implementation always constructs, for catalogs without a table-type
+    /// concept.
     ///
     /// # Errors
     /// Same as [`Catalog::get_table`].
-    async fn load_table_routing(
-        &self,
-        identifier: &Identifier,
-        engine_types: &std::collections::HashSet<TableType>,
-    ) -> Result<RoutedTableLoad> {
-        let _ = engine_types;
-        Ok(RoutedTableLoad::Paimon(Box::new(
+    async fn load_table(&self, identifier: &Identifier) -> Result<LoadedTable> {
+        Ok(LoadedTable::Paimon(Box::new(
             self.get_table(identifier).await?,
         )))
     }

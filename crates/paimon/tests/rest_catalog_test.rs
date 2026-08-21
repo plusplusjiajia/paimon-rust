@@ -1503,10 +1503,9 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
 }
 
 #[tokio::test]
-async fn test_load_table_routing_returns_engine_for_declared_type() {
-    use paimon::catalog::RoutedTableLoad;
+async fn test_load_table_returns_external_for_declared_type() {
+    use paimon::catalog::LoadedTable;
     use paimon::spec::TableType;
-    use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
     let schema = Schema::builder()
@@ -1518,29 +1517,15 @@ async fn test_load_table_routing_returns_engine_for_declared_type() {
         .add_table_with_schema("default", "ice_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "ice_t");
-    let engine_types = HashSet::from([TableType::IcebergTable]);
-    let routed = ctx
-        .catalog
-        .load_table_routing(&identifier, &engine_types)
-        .await
-        .unwrap();
+    let routed = ctx.catalog.load_table(&identifier).await.unwrap();
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
+        matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
-
-    let routed = ctx
-        .catalog
-        .load_table_routing(&identifier, &HashSet::new())
-        .await;
-    assert!(!matches!(routed, Ok(RoutedTableLoad::Engine(_))));
 }
 
 #[tokio::test]
-async fn test_load_table_routing_fails_closed_on_query_auth() {
-    use paimon::spec::TableType;
-    use std::collections::HashSet;
-
+async fn test_load_table_fails_closed_on_query_auth() {
     let ctx = setup_catalog(vec!["default"]).await;
     let schema = Schema::builder()
         .column("id", DataType::BigInt(BigIntType::new()))
@@ -1552,12 +1537,7 @@ async fn test_load_table_routing_fails_closed_on_query_auth() {
         .add_table_with_schema("default", "authed_ice_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "authed_ice_t");
-    let engine_types = HashSet::from([TableType::IcebergTable]);
-    let err = ctx
-        .catalog
-        .load_table_routing(&identifier, &engine_types)
-        .await
-        .unwrap_err();
+    let err = ctx.catalog.load_table(&identifier).await.unwrap_err();
     assert!(
         matches!(err, paimon::Error::Unsupported { ref message } if message.contains("query-auth")),
         "{err:?}"
@@ -1565,10 +1545,8 @@ async fn test_load_table_routing_fails_closed_on_query_auth() {
 }
 
 #[tokio::test]
-async fn test_load_table_routing_constructs_paimon_for_undeclared_type() {
-    use paimon::catalog::RoutedTableLoad;
-    use paimon::spec::TableType;
-    use std::collections::HashSet;
+async fn test_load_table_constructs_paimon_for_undeclared_type() {
+    use paimon::catalog::LoadedTable;
 
     let ctx = setup_catalog(vec!["default"]).await;
     let schema = Schema::builder()
@@ -1579,14 +1557,9 @@ async fn test_load_table_routing_constructs_paimon_for_undeclared_type() {
         .add_table_with_schema("default", "plain_t", schema, "file:///unused");
 
     let identifier = Identifier::new("default", "plain_t");
-    let engine_types = HashSet::from([TableType::IcebergTable]);
-    let routed = ctx
-        .catalog
-        .load_table_routing(&identifier, &engine_types)
-        .await
-        .unwrap();
+    let routed = ctx.catalog.load_table(&identifier).await.unwrap();
     match routed {
-        RoutedTableLoad::Paimon(table) => {
+        LoadedTable::Paimon(table) => {
             assert_eq!(table.identifier().full_name(), "default.plain_t");
         }
         other => panic!("expected a constructed Paimon table, got {other:?}"),
@@ -1617,10 +1590,9 @@ async fn test_get_table_fails_closed_on_iceberg_table() {
 }
 
 #[tokio::test]
-async fn test_load_table_routing_parses_declared_type_case_insensitively() {
-    use paimon::catalog::RoutedTableLoad;
+async fn test_load_table_parses_declared_type_case_insensitively() {
+    use paimon::catalog::LoadedTable;
     use paimon::spec::TableType;
-    use std::collections::HashSet;
 
     let ctx = setup_catalog(vec!["default"]).await;
     let schema = Schema::builder()
@@ -1633,22 +1605,17 @@ async fn test_load_table_routing_parses_declared_type_case_insensitively() {
 
     let routed = ctx
         .catalog
-        .load_table_routing(
-            &Identifier::new("default", "upper_ice_t"),
-            &HashSet::from([TableType::IcebergTable]),
-        )
+        .load_table(&Identifier::new("default", "upper_ice_t"))
         .await
         .unwrap();
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
+        matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
 }
 
 #[tokio::test]
-async fn test_load_table_routing_rejects_unknown_declared_type() {
-    use std::collections::HashSet;
-
+async fn test_load_table_rejects_unknown_declared_type() {
     let ctx = setup_catalog(vec!["default"]).await;
     let valid = Schema::builder()
         .column("id", DataType::BigInt(BigIntType::new()))
@@ -1662,7 +1629,7 @@ async fn test_load_table_routing_rejects_unknown_declared_type() {
 
     let err = ctx
         .catalog
-        .load_table_routing(&Identifier::new("default", "delta_t"), &HashSet::new())
+        .load_table(&Identifier::new("default", "delta_t"))
         .await
         .unwrap_err();
     assert!(

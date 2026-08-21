@@ -197,7 +197,6 @@ impl FileSystemCatalog {
         Ok((table_path, schema))
     }
 
-    /// Build a Table from an already-fetched schema.
     fn build_table(
         &self,
         identifier: &Identifier,
@@ -357,25 +356,19 @@ impl Catalog for FileSystemCatalog {
         self.build_table(identifier, table_path, schema)
     }
 
-    async fn load_table_routing(
-        &self,
-        identifier: &Identifier,
-        engine_types: &std::collections::HashSet<TableType>,
-    ) -> Result<crate::catalog::RoutedTableLoad> {
+    async fn load_table(&self, identifier: &Identifier) -> Result<crate::catalog::LoadedTable> {
         let (table_path, schema) = self.fetch_table_schema(identifier).await?;
         let options = CoreOptions::new(schema.options());
         let declared = options.table_type()?;
-        if engine_types.contains(&declared) {
-            // Neither this client nor an engine can enforce the
-            // server-side row filter / column mask.
-            return crate::catalog::RoutedTableLoad::engine(
+        if declared.requires_table_engine() {
+            return crate::catalog::LoadedTable::external(
                 declared,
                 &options,
                 &identifier.full_name(),
             );
         }
         self.build_table(identifier, table_path, schema)
-            .map(|table| crate::catalog::RoutedTableLoad::Paimon(Box::new(table)))
+            .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
@@ -836,8 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stored_scan_selectors_block_routing() {
-        use crate::catalog::RoutedTableLoad;
-        use std::collections::HashSet;
+        use crate::catalog::LoadedTable;
 
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -865,10 +857,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let err = catalog
-                .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
-                .await
-                .unwrap_err();
+            let err = catalog.load_table(&identifier).await.unwrap_err();
             assert!(matches!(err, Error::Unsupported { .. }), "{key}: {err:?}");
         }
 
@@ -885,16 +874,13 @@ mod tests {
             .create_table(&identifier, schema, false)
             .await
             .unwrap();
-        let routed = catalog
-            .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
-            .await
-            .unwrap();
-        assert!(matches!(routed, RoutedTableLoad::Engine(_)), "{routed:?}");
+        let routed = catalog.load_table(&identifier).await.unwrap();
+        assert!(matches!(routed, LoadedTable::External(_)), "{routed:?}");
     }
 
     #[tokio::test]
     async fn test_routing_cannot_skip_the_read_guards() {
-        use crate::catalog::RoutedTableLoad;
+        use crate::catalog::LoadedTable;
         use crate::spec::CoreOptions;
 
         // The only constructor of the `Engine` variant, so a third-party
@@ -905,7 +891,7 @@ mod tests {
             ("incremental-between", "1,5"),
         ] {
             let options = HashMap::from([(key.to_string(), value.to_string())]);
-            let err = RoutedTableLoad::engine(
+            let err = LoadedTable::external(
                 TableType::IcebergTable,
                 &CoreOptions::new(&options),
                 "db1.t",
@@ -915,7 +901,7 @@ mod tests {
         }
 
         let options = HashMap::new();
-        assert!(RoutedTableLoad::engine(
+        assert!(LoadedTable::external(
             TableType::IcebergTable,
             &CoreOptions::new(&options),
             "db1.t",
@@ -957,8 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_declared_engine_type_routes_and_fails_closed() {
-        use crate::catalog::RoutedTableLoad;
-        use std::collections::HashSet;
+        use crate::catalog::LoadedTable;
 
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -979,12 +964,9 @@ mod tests {
             .await
             .unwrap();
 
-        let routed = catalog
-            .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
-            .await
-            .unwrap();
+        let routed = catalog.load_table(&identifier).await.unwrap();
         assert!(
-            matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
+            matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
             "{routed:?}"
         );
 
@@ -994,12 +976,6 @@ mod tests {
                 if message.contains("cannot be read as a Paimon table")),
             "{err:?}"
         );
-
-        let err = catalog
-            .load_table_routing(&identifier, &HashSet::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
     }
 
     #[tokio::test]

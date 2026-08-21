@@ -215,19 +215,13 @@ impl Catalog for RESTCatalog {
         .await
     }
 
-    async fn load_table_routing(
-        &self,
-        identifier: &Identifier,
-        engine_types: &std::collections::HashSet<crate::spec::TableType>,
-    ) -> Result<crate::catalog::RoutedTableLoad> {
+    async fn load_table(&self, identifier: &Identifier) -> Result<crate::catalog::LoadedTable> {
         let response = RESTEnv::fetch_table_response(identifier, &self.api).await?;
         if let Some(schema) = response.schema.as_ref() {
             let options = crate::spec::CoreOptions::new(schema.options());
             let declared = options.table_type()?;
-            if engine_types.contains(&declared) {
-                // Neither this client nor an engine can enforce the
-                // server-side row filter / column mask.
-                return crate::catalog::RoutedTableLoad::engine(
+            if declared.requires_table_engine() {
+                return crate::catalog::LoadedTable::external(
                     declared,
                     &options,
                     &identifier.full_name(),
@@ -243,7 +237,7 @@ impl Catalog for RESTCatalog {
             self.local_cache.clone(),
         )
         .await
-        .map(|table| crate::catalog::RoutedTableLoad::Paimon(Box::new(table)))
+        .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {

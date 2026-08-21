@@ -432,9 +432,8 @@ async fn test_special_char_names() {
 
 #[tokio::test]
 async fn declared_engine_type_routes_through_the_rest_catalog() {
-    use paimon::catalog::RoutedTableLoad;
+    use paimon::catalog::LoadedTable;
     use paimon::spec::TableType;
-    use std::collections::HashSet;
 
     let ctx = setup().await;
     ctx.catalog
@@ -455,11 +454,11 @@ async fn declared_engine_type_routes_through_the_rest_catalog() {
 
     let routed = ctx
         .catalog
-        .load_table_routing(&identifier, &HashSet::from([TableType::IcebergTable]))
+        .load_table(&identifier)
         .await
         .expect("routing must reach the declared type");
     assert!(
-        matches!(routed, RoutedTableLoad::Engine(ref e) if e.declared() == TableType::IcebergTable),
+        matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
         "{routed:?}"
     );
 

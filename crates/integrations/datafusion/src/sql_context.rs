@@ -348,7 +348,7 @@ impl SQLContext {
         paimon_provider.register_temp_table(&database, &table_name, table)
     }
 
-    /// Whether `name` was registered through the Paimon registration path.
+    /// Whether `name` is a Paimon catalog, rather than one DataFusion holds.
     pub fn is_paimon_catalog(&self, name: &str) -> bool {
         self.catalogs.contains_key(name)
     }
