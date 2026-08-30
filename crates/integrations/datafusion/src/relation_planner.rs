@@ -93,15 +93,23 @@ impl RelationPlanner for PaimonRelationPlanner {
             ));
         }
 
+        // Not ours: relation planners are session-global, so another
+        // engine's planner may handle the clause for its own provider.
+        let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
+            return Ok(RelationPlanning::Original(Box::new(relation)));
+        };
+
         let extra_options = match version {
             TableVersion::VersionAsOf(expr) => resolve_version_as_of(expr)?,
             TableVersion::TimestampAsOf(expr) => resolve_timestamp_as_of(expr)?,
-            _ => return Ok(RelationPlanning::Original(Box::new(relation))),
-        };
-
-        // Check if this is a Paimon table.
-        let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
-            return Ok(RelationPlanning::Original(Box::new(relation)));
+            // Falling through would answer a historical clause with
+            // current rows.
+            _ => {
+                return Err(plan_datafusion_err!(
+                    "this time-travel syntax is not supported for Paimon tables; \
+                     use VERSION AS OF or TIMESTAMP AS OF"
+                ))
+            }
         };
 
         // Resolving time travel may switch the table to the snapshot's schema,

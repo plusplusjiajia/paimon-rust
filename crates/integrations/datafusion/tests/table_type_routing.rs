@@ -648,6 +648,84 @@ async fn object_and_lance_tables_route_to_engines() {
 }
 
 #[tokio::test]
+async fn an_unsupported_time_travel_clause_on_a_paimon_table_is_rejected() {
+    use datafusion::prelude::SessionContext;
+    use paimon_datafusion::PaimonCatalogProvider;
+
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
+    let plain = PaimonSchema::builder()
+        .column(
+            "id",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_table(&Identifier::new(DB, "pt"), plain, false)
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        CATALOG,
+        Arc::new(PaimonCatalogProvider::new(
+            Some(CATALOG.to_string()),
+            fs_catalog,
+            Default::default(),
+            Default::default(),
+            None,
+        )),
+    );
+    paimon_datafusion::register_catalog_table_engine(
+        &ctx,
+        CATALOG,
+        TableType::IcebergTable,
+        Arc::new(FakeEngineResolver),
+    )
+    .unwrap();
+    // The default dialect does not parse a version clause at all; these are
+    // the dialects that do, and where the clause used to be dropped.
+    for dialect in ["databricks", "mssql", "bigquery", "snowflake"] {
+        ctx.sql(&format!("SET datafusion.sql_parser.dialect = '{dialect}'"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT * FROM {CATALOG}.{DB}.pt FOR SYSTEM_TIME AS OF '2020-01-01'");
+        let outcome = match ctx.sql(&sql).await {
+            Err(err) => Err(err),
+            Ok(df) => df.collect().await.map(|_| ()),
+        };
+        let Err(err) = outcome else {
+            panic!("[{dialect}] a historical clause must not answer with current rows");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("VERSION AS OF"), "[{dialect}] {msg}");
+
+        // The supported syntax still resolves through the same planner.
+        let err = ctx
+            .sql(&format!("SELECT * FROM {CATALOG}.{DB}.pt VERSION AS OF 1"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("[{dialect}] snapshot 1 does not exist in this fixture"));
+        assert!(err.to_string().contains("Snapshot 1"), "[{dialect}] {err}");
+    }
+}
+
+#[tokio::test]
 async fn time_travel_on_routed_tables_is_rejected() {
     let env = setup().await;
     env.ctx
