@@ -1552,20 +1552,41 @@ impl<'a> PaimonTableScan<'a> {
         Ok((plan.planned(grant), trace))
     }
 
-    /// The scan a restricted grant plans: a limit cannot count rows the row
-    /// filter drops.
+    /// The scan a restricted grant plans: pruning must not read a masked
+    /// column's raw value (Java `excludeFields`), and a limit cannot count rows
+    /// the row filter drops.
     fn restricted_by(&self, grant: &super::query_auth::QueryAuthGrant) -> Self {
         let rules = grant.rules();
+        let fields = self.table.schema().fields();
+        let masked: HashSet<&str> = rules
+            .masks
+            .iter()
+            .map(|m| fields[m.column].name())
+            .collect();
+        // By name: the bucket predicate is indexed by bucket-key position.
+        let touches_masked = |predicate: &Predicate| {
+            super::query_auth::leaf_names(std::slice::from_ref(predicate))
+                .iter()
+                .any(|name| masked.contains(name.as_str()))
+        };
         let mut scan = self.clone();
-        if !rules.filters.is_empty() {
+        scan.data_predicates.retain(|p| !touches_masked(p));
+        if scan.bucket_predicate.as_ref().is_some_and(touches_masked) {
+            scan.bucket_predicate = None;
+        }
+        let dropped = scan.data_predicates.len() != self.data_predicates.len();
+        if !rules.filters.is_empty() || dropped {
             scan.limit = scan.limit.filter(|limit| *limit == 0);
         }
-        // Column-slice pruning must keep the files holding the filter's columns.
+        // Column-slice pruning must keep the files holding the rules' columns.
         if let Some(ids) = scan.projected_read_field_ids.as_mut() {
-            let fields = self.table.schema().fields();
+            let mut columns = rules.filter_columns();
+            for mask in &rules.masks {
+                columns.insert(mask.column);
+                columns.extend(super::query_auth::mask_inputs(mask));
+            }
             ids.extend(
-                rules
-                    .filter_columns()
+                columns
                     .into_iter()
                     .filter_map(|i| fields.get(i))
                     .map(|f| f.id()),
@@ -1663,6 +1684,27 @@ impl<'a> PaimonTableScan<'a> {
             .table
             .authorize_read(query_auth, self.query_auth_select())
             .await?;
+        // Partition pruning reads the raw key, and engines push partition
+        // filters past the read (Java `rejectMaskedPartitionFilter`).
+        if let Some(grant) = &grant {
+            let fields = self.table.schema().fields();
+            let masked: Vec<&str> = grant
+                .rules()
+                .masks
+                .iter()
+                .map(|m| fields[m.column].name())
+                .collect();
+            if let Some(key) = self
+                .partition_filter_columns()
+                .into_iter()
+                .find(|key| masked.contains(&key.as_str()))
+            {
+                return Err(super::query_auth::unsupported(&format!(
+                    "the partition key '{key}' is masked, so a filter on it would match the raw \
+                     value"
+                )));
+            }
+        }
         Ok(grant)
     }
 

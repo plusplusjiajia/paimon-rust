@@ -1127,9 +1127,10 @@ impl ExecutionPlan for PaimonTableScan {
             .into_iter()
             .map(|result| result.filter)
             .collect::<Vec<_>>();
-        if filters.is_empty() {
+        // The decoder would match raw values; the filter above sees masked ones.
+        if filters.is_empty() || self.has_query_auth_rules() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                Vec::new(),
+                vec![PushedDown::No; filters.len()],
             ));
         }
 
@@ -1190,7 +1191,7 @@ impl ExecutionPlan for PaimonTableScan {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        // They include the rows the server's rules drop.
+        // They include the rows the server's rules drop and the raw values they mask.
         if self.has_query_auth_rules() {
             return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
         }

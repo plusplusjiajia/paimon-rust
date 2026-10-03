@@ -2831,6 +2831,14 @@ fn int_leaf(index: usize, column: &str, function: &str, literal: i32) -> serde_j
     })
 }
 
+fn string_ref(index: usize, column: &str) -> serde_json::Value {
+    serde_json::json!({"index": index, "name": column, "type": "VARCHAR(255)"})
+}
+
+fn upper(index: usize, column: &str) -> serde_json::Value {
+    serde_json::json!({"name": "UPPER", "inputs": [string_ref(index, column)]})
+}
+
 #[tokio::test]
 async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning() {
     let g = guarded("unparseable", &["id"]).await;
@@ -3298,6 +3306,205 @@ async fn test_query_auth_row_filter_returns_only_the_rows_it_admits() {
     assert!(limited_ids.iter().all(|id| *id > 6), "{limited_ids:?}");
 }
 
+#[tokio::test]
+async fn test_query_auth_refuses_a_mask_that_reads_another_masked_column() {
+    let g = guarded("chained", &["id", "a", "b"]).await;
+    let field_ref = |index: usize, column: &str| {
+        serde_json::json!({
+            "name": "FIELD_REF",
+            "fieldRef": {"index": index, "name": column, "type": "INT"},
+        })
+    };
+    let hidden = serde_json::json!({"name": "NULL"});
+
+    g.ctx.server.set_auth_response(
+        "default",
+        "chained",
+        rules(&[], &[("a", hidden.clone()), ("b", field_ref(0, "id"))]),
+    );
+    g.table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("a mask may read an unmasked column");
+
+    g.ctx.server.set_auth_response(
+        "default",
+        "chained",
+        rules(&[], &[("a", hidden), ("b", field_ref(1, "a"))]),
+    );
+    assert_refused(plan_err(&g.table, "'b' would publish the raw value of 'a'").await);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_masks_a_column_and_leaves_the_others_raw() {
+    let g = written(
+        "masked",
+        people,
+        vec![people_batch(&[(1, "alice"), (2, "carol")])],
+    )
+    .await;
+    let name = || string_ref(1, "name");
+    for (mask, expected) in [
+        (serde_json::json!({"name": "NULL"}), [None, None]),
+        (upper(1, "name"), [Some("ALICE"), Some("CAROL")]),
+        // Arrow strings carry no width, so the mask must truncate itself.
+        (
+            serde_json::json!({"name": "CAST", "fieldRef": name(), "type": "VARCHAR(3)"}),
+            [Some("ali"), Some("car")],
+        ),
+        (
+            serde_json::json!({"name": "CONCAT", "inputs": ["user-", name()]}),
+            [Some("user-alice"), Some("user-carol")],
+        ),
+    ] {
+        g.ctx
+            .server
+            .set_auth_response("default", "masked", rules(&[], &[("name", mask.clone())]));
+        assert_eq!(
+            id_names(&read_all(&g.table.new_read_builder()).await.unwrap()),
+            vec![
+                (1, expected[0].map(String::from)),
+                (2, expected[1].map(String::from))
+            ],
+            "{mask}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_filters_a_masked_column_on_its_masked_value() {
+    let g = written(
+        "upper",
+        people,
+        vec![people_batch(&[(1, "alice"), (2, "bob")])],
+    )
+    .await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "upper",
+        rules(&[], &[("name", upper(1, "name"))]),
+    );
+    let name_is = |value: &str| {
+        PredicateBuilder::new(g.table.schema().fields())
+            .equal("name", Datum::String(value.to_string()))
+            .unwrap()
+    };
+
+    // The file's raw bounds, 'alice'..'bob', exclude 'ALICE': pruning on them
+    // would lose the row.
+    let mut masked = g.table.new_read_builder();
+    masked.with_filter(name_is("ALICE"));
+    assert_eq!(
+        id_names(&read_all(&masked).await.unwrap()),
+        vec![(1, Some("ALICE".to_string()))]
+    );
+    masked.with_projection(&["id"]).unwrap();
+    assert_eq!(ids(&read_all(&masked).await.unwrap()), vec![1]);
+
+    let mut raw = g.table.new_read_builder();
+    raw.with_filter(name_is("alice"));
+    assert!(read_all(&raw)
+        .await
+        .unwrap()
+        .iter()
+        .all(|b| b.num_rows() == 0));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_does_not_prune_buckets_on_a_masked_bucket_key() {
+    // `name` is the only bucket key, so the bucket predicate indexes it as 0,
+    // which is `id` in the table schema.
+    let schema = |options: &[(&str, &str)]| {
+        let mut all = vec![("bucket", "4"), ("bucket-key", "name")];
+        all.extend_from_slice(options);
+        people(&all)
+    };
+    let g = written("bucketed", schema, vec![people_rows(1..=10)]).await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "bucketed",
+        rules(&[], &[("name", upper(1, "name"))]),
+    );
+    for (id, name) in (1..=10).zip(NAMES) {
+        let mut builder = g.table.new_read_builder();
+        builder.with_filter(
+            PredicateBuilder::new(g.table.schema().fields())
+                .equal("name", Datum::String(name.to_uppercase()))
+                .unwrap(),
+        );
+        assert_eq!(
+            id_names(&read_all(&builder).await.unwrap()),
+            vec![(id, Some(name.to_uppercase()))],
+            "the raw value's bucket is not the masked value's"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_a_partition_filter_on_a_masked_partition_key() {
+    let schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("dept", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["dept"]);
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("dept", ArrowDataType::Utf8, true),
+            ArrowField::new("id", ArrowDataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["eng", "ops"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let g = written("by_dept", schema, vec![batch]).await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "by_dept",
+        rules(&[], &[("dept", upper(0, "dept"))]),
+    );
+
+    let batches = read_all(&g.table.new_read_builder()).await.unwrap();
+    let mut rows: Vec<(String, i32)> = batches
+        .iter()
+        .flat_map(|b| {
+            let depts = column::<StringArray>(b, "dept");
+            let ids = column::<Int32Array>(b, "id");
+            (0..b.num_rows())
+                .map(|r| (depts.value(r).to_string(), ids.value(r)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![("ENG".to_string(), 1), ("OPS".to_string(), 2)]);
+
+    let mut by_dept = g.table.new_read_builder();
+    by_dept.with_filter(
+        PredicateBuilder::new(g.table.schema().fields())
+            .equal("dept", Datum::String("ENG".to_string()))
+            .unwrap(),
+    );
+    assert_refused(
+        by_dept
+            .new_scan()
+            .plan()
+            .await
+            .expect_err("partition pruning would match the raw key"),
+    );
+}
+
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_query_auth_asks_about_the_projection_and_the_columns_filters_read() {
@@ -3466,6 +3673,24 @@ async fn test_query_auth_filters_the_merged_primary_key_row() {
     assert_eq!(
         score_rows(&read_all(&g.table.new_read_builder()).await.unwrap()),
         vec![(1, "alicia".to_string(), 80), (3, "carol".to_string(), 90)]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_masks_the_merged_primary_key_row() {
+    let g = scores().await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "scores",
+        rules(
+            &[int_leaf(2, "score", "GREATER_THAN", 30)],
+            &[("name", upper(1, "name"))],
+        ),
+    );
+    assert_eq!(
+        score_rows(&read_all(&g.table.new_read_builder()).await.unwrap()),
+        vec![(1, "ALICIA".to_string(), 80), (3, "CAROL".to_string(), 90)]
     );
 }
 

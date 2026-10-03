@@ -15,22 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The server's row filter, parsed against the schema it ruled on and applied
-//! to read batches, as Java `TableQueryAuthResult` does.
+//! The server's row filter and column masking, parsed against the schema it
+//! ruled on and applied to read batches, as Java `TableQueryAuthResult` does.
 
 use super::unsupported;
 use crate::api::AuthTableQueryResponse;
 use crate::arrow::residual::{evaluate_exact_leaf_predicate, sanitize_filter_mask};
-use crate::spec::{DataField, Predicate};
+use crate::spec::{DataField, Predicate, Transform, TransformInput};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, BooleanArray, Float32Array, Float64Array, RecordBatch};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// The rules of one grant; leaf indices are table-schema positions.
+/// Masks one column, by table-schema index.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ColumnMask {
+    pub(crate) column: usize,
+    pub(crate) transform: Transform,
+}
+
+/// The rules of one grant; leaf and mask indices are table-schema positions.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Rules {
     pub(crate) filters: Vec<Predicate>,
+    pub(crate) masks: Vec<ColumnMask>,
 }
 
 impl Rules {
@@ -54,19 +62,70 @@ impl Rules {
             filters.push(filter);
         }
 
-        // Not applied yet: refusing beats returning raw values.
-        if response
-            .column_masking
-            .as_ref()
-            .is_some_and(|masks| !masks.is_empty())
-        {
-            return Err(unsupported("this client does not apply column masking yet"));
+        let mut masks = Vec::new();
+        for (column, json) in response.column_masking.iter().flatten() {
+            if column.is_empty() || json.is_empty() {
+                return Err(unsupported("the server sent an empty column mask"));
+            }
+            // Never projected on a query-auth read, so the mask is inert. Java exempts
+            // `SYSTEM_FIELD_NAMES` only, which has no `_KEY_` name.
+            if crate::spec::is_reserved_system_field_name(column) && !column.starts_with("_KEY_") {
+                // Java still parses it, so a malformed one fails all the same.
+                let parsed = serde_json::from_str::<serde_json::Value>(json);
+                if !parsed.is_ok_and(|value| !value.is_null()) {
+                    return Err(unsupported(&format!(
+                        "cannot parse the server's mask on '{column}'"
+                    )));
+                }
+                continue;
+            }
+            let target = fields
+                .iter()
+                .position(|f| f.name() == column)
+                .ok_or_else(|| {
+                    unsupported(&format!(
+                        "the server masks '{column}', which is not a column"
+                    ))
+                })?;
+            let transform = Transform::from_rest_json(json, fields).map_err(|e| {
+                unsupported(&format!(
+                    "cannot parse the server's mask on '{column}': {e}"
+                ))
+            })?;
+            check_mask_fits(&transform, &fields[target], fields)?;
+            masks.push(ColumnMask {
+                column: target,
+                transform,
+            });
         }
-        Ok(Self { filters })
+        masks.sort_by_key(|m| m.column);
+
+        // A transform reads raw values, so an input masked by another rule would
+        // publish that raw value through this target (Java refuses the pair).
+        let targets: HashSet<usize> = masks.iter().map(|m| m.column).collect();
+        for mask in &masks {
+            if let Some(other) = mask_inputs(mask)
+                .into_iter()
+                .find(|i| *i != mask.column && targets.contains(i))
+            {
+                return Err(unsupported(&format!(
+                    "the mask on '{}' reads '{}', which is masked too, so it would expose the \
+                     raw value",
+                    fields[mask.column].name(),
+                    fields[other].name()
+                )));
+            }
+        }
+        Ok(Self { filters, masks })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.filters.is_empty()
+        self.filters.is_empty() && self.masks.is_empty()
+    }
+
+    /// Table-schema indices of masked columns.
+    pub(crate) fn masked_columns(&self) -> HashSet<usize> {
+        self.masks.iter().map(|m| m.column).collect()
     }
 
     /// Table-schema indices the row filter reads.
@@ -77,6 +136,66 @@ impl Rules {
         }
         out
     }
+}
+
+/// Table-schema indices a mask reads.
+pub(crate) fn mask_inputs(mask: &ColumnMask) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    mask.transform.collect_field_indices(&mut out);
+    out
+}
+
+/// The masked value replaces the column in place, so it must keep its type and
+/// may only be null where the column may be.
+fn check_mask_fits(transform: &Transform, target: &DataField, fields: &[DataField]) -> Result<()> {
+    let column_type = crate::arrow::paimon_type_to_arrow(target.data_type())?;
+    if let Some(output) = mask_output_type(transform, fields) {
+        if output != column_type {
+            return Err(unsupported(&format!(
+                "the mask on '{}' produces {output:?}, but the column is {column_type:?}",
+                target.name()
+            )));
+        }
+    }
+    if !target.data_type().is_nullable() && mask_can_be_null(transform, fields) {
+        return Err(unsupported(&format!(
+            "the mask on '{}' can produce null, but the column is NOT NULL",
+            target.name()
+        )));
+    }
+    if let Transform::Cast(index, to) = transform {
+        let from = fields[*index].data_type();
+        if !cast_agrees_with_java(from, to) {
+            return Err(unsupported(&format!(
+                "the mask on '{}' casts {from:?} to {to:?}, which this client does not convert as \
+                 Java does",
+                target.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Arrow's casts differ from Java's for most type pairs (an INT cast to
+/// TIMESTAMP is milliseconds in Arrow, seconds in Java), so only these pass:
+/// the same type, strings and bytes among themselves, strings to bytes, and
+/// integers or booleans to strings.
+fn cast_agrees_with_java(from: &crate::spec::DataType, to: &crate::spec::DataType) -> bool {
+    use crate::spec::DataType as Paimon;
+    let string = |t: &Paimon| matches!(t, Paimon::Char(_) | Paimon::VarChar(_));
+    let bytes = |t: &Paimon| matches!(t, Paimon::Binary(_) | Paimon::VarBinary(_));
+    let integer = |t: &Paimon| {
+        matches!(
+            t,
+            Paimon::TinyInt(_) | Paimon::SmallInt(_) | Paimon::Int(_) | Paimon::BigInt(_)
+        )
+    };
+    let same = matches!(
+        (from.copy_with_nullable(true), to.copy_with_nullable(true)),
+        (Ok(from), Ok(to)) if from == to
+    );
+    same || string(to) && (string(from) || integer(from) || matches!(from, Paimon::Boolean(_)))
+        || bytes(to) && (bytes(from) || string(from))
 }
 
 fn mentioned_system_column(json: &str) -> Option<&'static str> {
@@ -229,6 +348,234 @@ fn eval_err(e: &dyn std::fmt::Display) -> crate::Error {
     unsupported(&format!("cannot evaluate the server's rules: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Column masking
+// ---------------------------------------------------------------------------
+
+/// Overwrites every copy of each masked column. Inputs come from `batch` as
+/// read, before any mask, as in Java.
+pub(crate) fn mask_batch(
+    batch: &RecordBatch,
+    masks: &[ColumnMask],
+    schema_fields: &[DataField],
+    batch_fields: &[DataField],
+) -> Result<RecordBatch> {
+    if masks.is_empty() {
+        return Ok(batch.clone());
+    }
+    let input = |index: usize| -> Result<ArrayRef> {
+        let field = schema_fields
+            .get(index)
+            .ok_or_else(|| unsupported("the server's mask reads an unknown column"))?;
+        column_of(batch, field, batch_fields)
+    };
+    let mut columns = batch.columns().to_vec();
+    for mask in masks {
+        let field = &schema_fields[mask.column];
+        // By id: the caller may project the column twice.
+        let targets: Vec<usize> = batch_fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.id() == field.id())
+            .map(|(position, _)| position)
+            .collect();
+        let Some(&first) = targets.first() else {
+            return Err(unsupported(&format!(
+                "the read does not carry '{}', which the server masks",
+                field.name()
+            )));
+        };
+        let target_type = batch.schema().field(first).data_type().clone();
+        let masked: ArrayRef = match &mask.transform {
+            Transform::Null => arrow_array::new_null_array(&target_type, batch.num_rows()),
+            Transform::FieldRef(index) => input(*index)?,
+            Transform::Cast(index, to) => {
+                let cast = cast_to(&input(*index)?, &crate::arrow::paimon_type_to_arrow(to)?)?;
+                // Arrow has no CHAR/VARCHAR width; apply it as Java does.
+                apply_declared_width(&cast, to)
+            }
+            Transform::Upper(inputs) => string_mask(batch, inputs, &input, |v| {
+                Some(v.first()?.as_ref().map(|s| s.to_uppercase()))
+            })?,
+            Transform::Lower(inputs) => string_mask(batch, inputs, &input, |v| {
+                Some(v.first()?.as_ref().map(|s| s.to_lowercase()))
+            })?,
+            // Null if any input is null.
+            Transform::Concat(inputs) => string_mask(batch, inputs, &input, |v| {
+                Some(
+                    v.iter()
+                        .cloned()
+                        .collect::<Option<Vec<_>>>()
+                        .map(|p| p.concat()),
+                )
+            })?,
+            // The first input separates and nulls are skipped.
+            Transform::ConcatWs(inputs) => string_mask(batch, inputs, &input, |v| {
+                let (separator, rest) = v.split_first()?;
+                Some(separator.as_ref().map(|separator| {
+                    rest.iter()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(separator)
+                }))
+            })?,
+        };
+        let masked = cast_to(&masked, &target_type)?;
+        for position in targets {
+            columns[position] = Arc::clone(&masked);
+        }
+    }
+    RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| eval_err(&e))
+}
+
+fn mask_can_be_null(transform: &Transform, fields: &[DataField]) -> bool {
+    let nullable = |input: &TransformInput| match input {
+        TransformInput::Literal(literal) => literal.is_none(),
+        TransformInput::Field(index) => fields[*index].data_type().is_nullable(),
+    };
+    match transform {
+        Transform::Null => true,
+        Transform::FieldRef(index) | Transform::Cast(index, _) => {
+            fields[*index].data_type().is_nullable()
+        }
+        Transform::Upper(inputs) | Transform::Lower(inputs) | Transform::Concat(inputs) => {
+            inputs.iter().any(nullable)
+        }
+        // Only a null separator makes CONCAT_WS null.
+        Transform::ConcatWs(inputs) => inputs.first().is_some_and(nullable),
+    }
+}
+
+/// `None` when the output always has the target's type (`NULL`).
+fn mask_output_type(transform: &Transform, fields: &[DataField]) -> Option<arrow_schema::DataType> {
+    match transform {
+        Transform::Null => None,
+        Transform::FieldRef(index) => {
+            crate::arrow::paimon_type_to_arrow(fields[*index].data_type()).ok()
+        }
+        Transform::Cast(_, to) => crate::arrow::paimon_type_to_arrow(to).ok(),
+        Transform::Upper(_)
+        | Transform::Lower(_)
+        | Transform::Concat(_)
+        | Transform::ConcatWs(_) => Some(arrow_schema::DataType::Utf8),
+    }
+}
+
+/// Java `BinaryStringUtils`: truncate when longer, pad the fixed-width forms.
+fn apply_declared_width(array: &ArrayRef, to: &crate::spec::DataType) -> ArrayRef {
+    use crate::spec::DataType as Paimon;
+    match to {
+        Paimon::VarChar(t) => fit_strings(array, t.length() as usize, false),
+        Paimon::Char(t) => fit_strings(array, t.length(), true),
+        Paimon::VarBinary(t) => fit_bytes(array, t.length() as usize, false),
+        Paimon::Binary(t) => fit_bytes(array, t.length(), true),
+        _ => Arc::clone(array),
+    }
+}
+
+/// Counts characters, as Java does.
+fn fit_strings(array: &ArrayRef, length: usize, pad: bool) -> ArrayRef {
+    let Some(strings) = array.as_any().downcast_ref::<arrow_array::StringArray>() else {
+        return Arc::clone(array);
+    };
+    let fitted: arrow_array::StringArray = strings
+        .iter()
+        .map(|value| {
+            value.map(|value| {
+                let chars = value.chars().count();
+                if chars > length {
+                    value.chars().take(length).collect::<String>()
+                } else if pad && chars < length {
+                    format!("{value}{}", " ".repeat(length - chars))
+                } else {
+                    value.to_string()
+                }
+            })
+        })
+        .collect();
+    Arc::new(fitted)
+}
+
+fn fit_bytes(array: &ArrayRef, length: usize, pad: bool) -> ArrayRef {
+    let Some(bytes) = array.as_any().downcast_ref::<arrow_array::BinaryArray>() else {
+        return Arc::clone(array);
+    };
+    let fitted: Vec<Option<Vec<u8>>> = bytes
+        .iter()
+        .map(|value| {
+            value.map(|value| {
+                let mut value = value.to_vec();
+                if value.len() > length || pad {
+                    value.resize(length, 0);
+                }
+                value
+            })
+        })
+        .collect();
+    Arc::new(arrow_array::BinaryArray::from(
+        fitted.iter().map(Option::as_deref).collect::<Vec<_>>(),
+    ))
+}
+
+/// A value that does not convert is an error, as Java's cast throws.
+fn cast_to(array: &ArrayRef, to: &arrow_schema::DataType) -> Result<ArrayRef> {
+    if array.data_type() == to {
+        return Ok(Arc::clone(array));
+    }
+    let options = arrow_cast::CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    arrow_cast::cast_with_options(array, to, &options).map_err(|e| eval_err(&e))
+}
+
+/// Row by row over resolved inputs (`None` = SQL NULL); `combine` returning
+/// `None` means the transform does not fit its input count.
+fn string_mask(
+    batch: &RecordBatch,
+    inputs: &[TransformInput],
+    input: &dyn Fn(usize) -> Result<ArrayRef>,
+    combine: impl Fn(&[Option<String>]) -> Option<Option<String>>,
+) -> Result<ArrayRef> {
+    let resolved: Vec<Option<ArrayRef>> = inputs
+        .iter()
+        .map(|i| match i {
+            TransformInput::Literal(_) => Ok(None),
+            TransformInput::Field(index) => {
+                cast_to(&input(*index)?, &arrow_schema::DataType::Utf8).map(Some)
+            }
+        })
+        .collect::<Result<_>>()?;
+    let mut values = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let row_inputs: Vec<Option<String>> = inputs
+            .iter()
+            .zip(&resolved)
+            .map(|(i, array)| match (i, array) {
+                (TransformInput::Literal(literal), _) => literal.clone(),
+                (TransformInput::Field(_), Some(array)) => {
+                    let strings = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .expect("cast to Utf8 above");
+                    (!strings.is_null(row)).then(|| strings.value(row).to_string())
+                }
+                (TransformInput::Field(_), None) => unreachable!("fields are resolved above"),
+            })
+            .collect();
+        let value = combine(&row_inputs)
+            .ok_or_else(|| unsupported("the server's string mask has the wrong inputs"))?;
+        values.push(value);
+    }
+    Ok(Arc::new(arrow_array::StringArray::from(values)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,8 +584,8 @@ mod tests {
         IntType, PredicateBuilder, PredicateOperator, TimestampType, VarBinaryType, VarCharType,
     };
     use arrow_array::{
-        Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatchOptions, StringArray,
-        TimestampMillisecondArray,
+        BinaryArray, Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatchOptions,
+        StringArray, TimestampMillisecondArray,
     };
     use arrow_schema::{Field, Schema};
 
@@ -303,9 +650,34 @@ mod tests {
         )
     }
 
+    /// A Java `FieldRef`, as a transform input.
+    fn input(field: &str) -> String {
+        format!(r#"{{"index":0,"name":"{field}","type":"STRING"}}"#)
+    }
+
+    fn field_ref(field: &str) -> String {
+        format!(r#"{{"name":"FIELD_REF","fieldRef":{}}}"#, input(field))
+    }
+
+    fn cast(field: &str, to: &str) -> String {
+        format!(
+            r#"{{"name":"CAST","fieldRef":{},"type":"{to}"}}"#,
+            input(field)
+        )
+    }
+
+    fn string_transform(name: &str, inputs: &[&str]) -> String {
+        format!(r#"{{"name":"{name}","inputs":[{}]}}"#, inputs.join(","))
+    }
+
     fn ids(batch: &RecordBatch) -> Vec<i32> {
         let ids = batch.column(0).as_any().downcast_ref::<Int32Array>();
         ids.unwrap().values().to_vec()
+    }
+
+    fn strings(batch: &RecordBatch, column: usize) -> Vec<Option<&str>> {
+        let strings = batch.column(column).as_any().downcast_ref::<StringArray>();
+        strings.unwrap().iter().collect()
     }
 
     // ---------------------------------------------------------------------
@@ -345,9 +717,26 @@ mod tests {
     }
 
     #[test]
-    fn test_any_mask_is_refused() {
-        let message = refusal(parse(&[], &[("name", NULL)], &rule_fields()));
-        assert!(message.contains("column masking"), "{message}");
+    fn test_parse_reads_the_masks() {
+        let fields = rule_fields();
+        let upper = string_transform("UPPER", &[&input("name")]);
+        let rules = parse(&[], &[("name", &upper), ("id", NULL)], &fields).unwrap();
+        // In schema order, whatever order the server listed them in.
+        assert_eq!(
+            rules.masks,
+            vec![
+                ColumnMask {
+                    column: 0,
+                    transform: Transform::Null
+                },
+                ColumnMask {
+                    column: 1,
+                    transform: Transform::Upper(vec![TransformInput::Field(1)])
+                },
+            ]
+        );
+        assert_eq!(rules.masked_columns(), HashSet::from([0, 1]));
+        assert_eq!(mask_inputs(&rules.masks[1]), HashSet::from([1]));
     }
 
     #[test]
@@ -371,6 +760,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_refuses_a_bad_mask() {
+        let fields = rule_fields();
+        let missing_input = field_ref("missing");
+        for (column, mask, reason) in [
+            ("", NULL, "empty column mask"),
+            ("name", "", "empty column mask"),
+            ("name", "null", "cannot parse"),
+            ("name", "{", "cannot parse"),
+            ("name", r#"{"name":"ROT13"}"#, "cannot parse"),
+            ("missing", NULL, "'missing', which is not a column"),
+            ("name", &missing_input, "unknown field `missing`"),
+        ] {
+            let message = refusal(parse(&[], &[(column, mask)], &fields));
+            assert!(message.contains(reason), "{column:?} {mask:?}: {message}");
+        }
+    }
+
+    #[test]
     fn test_a_filter_on_a_system_column_is_refused() {
         let fields = rule_fields();
         for column in ["_ROW_ID", "_SEQUENCE_NUMBER", "_VALUE_KIND", "rowkind"] {
@@ -380,6 +787,99 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_mask_on_a_system_column_is_inert() {
+        let fields = rule_fields();
+        // Never projected on a query-auth read, so a mask there is inert (Java).
+        for column in [
+            "_ROW_ID",
+            "_SEQUENCE_NUMBER",
+            "_VALUE_KIND",
+            "_LEVEL",
+            "rowkind",
+        ] {
+            let rules = parse(&[], &[(column, NULL)], &fields).unwrap();
+            assert!(rules.is_empty(), "{column}");
+        }
+        // Java's `SYSTEM_FIELD_NAMES` has no `_KEY_` names, so such a target is unknown.
+        let message = refusal(parse(&[], &[("_KEY_id", NULL)], &fields));
+        assert!(
+            message.contains("'_KEY_id', which is not a column"),
+            "{message}"
+        );
+        // Java parses every mask before skipping one.
+        for mask in ["null", "{"] {
+            let message = refusal(parse(&[], &[("_ROW_ID", mask)], &fields));
+            assert!(message.contains("cannot parse"), "{mask}: {message}");
+        }
+    }
+
+    #[test]
+    fn test_a_mask_must_keep_the_column_type() {
+        let fields = rule_fields();
+        for (column, mask) in [
+            ("id", string_transform("UPPER", &[&input("name")])),
+            ("id", string_transform("CONCAT", &[r#""x""#])),
+            ("id", field_ref("name")),
+            ("id", cast("id", "STRING")),
+            ("id", cast("id", "BIGINT")),
+            ("name", cast("name", "BINARY(3)")),
+        ] {
+            let message = refusal(parse(&[], &[(column, &mask)], &fields));
+            assert!(message.contains("produces"), "{mask}: {message}");
+        }
+        for (column, mask) in [
+            ("id", NULL.to_string()),
+            ("name", cast("id", "VARCHAR(2)")),
+            ("bin", cast("name", "BINARY(3)")),
+        ] {
+            assert!(parse(&[], &[(column, &mask)], &fields).is_ok(), "{mask}");
+        }
+    }
+
+    #[test]
+    fn test_a_not_null_column_takes_only_a_mask_that_cannot_be_null() {
+        let fields = rule_fields();
+        let (name, nn) = (input("name"), input("nn"));
+        for (mask, fits) in [
+            (NULL.to_string(), false),
+            (field_ref("name"), false),
+            (field_ref("nn"), true),
+            (cast("name", "STRING"), false),
+            (cast("nn", "VARCHAR(3)"), true),
+            (string_transform("UPPER", &[&nn]), true),
+            (string_transform("CONCAT", &[&nn, "null"]), false),
+            (string_transform("CONCAT_WS", &["null", &nn]), false),
+            // Only the separator can make CONCAT_WS null.
+            (string_transform("CONCAT_WS", &[r#""-""#, &nn, &name]), true),
+        ] {
+            let parsed = parse(&[], &[("nn", &mask)], &fields);
+            if fits {
+                assert!(parsed.is_ok(), "{mask}: {parsed:?}");
+            } else {
+                assert!(refusal(parsed).contains("can produce null"), "{mask}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_mask_may_not_read_another_masked_column() {
+        let fields = rule_fields();
+        let upper_name = string_transform("UPPER", &[&input("name")]);
+        assert!(parse(&[], &[("name", &upper_name)], &fields).is_ok());
+        assert!(parse(&[], &[("name", &upper_name), ("id", NULL)], &fields).is_ok());
+        // Masks read raw values, so `alias` would publish the raw `name`.
+        let message = refusal(parse(
+            &[],
+            &[("name", NULL), ("alias", &upper_name)],
+            &fields,
+        ));
+        assert!(
+            message.contains("reads 'name', which is masked too"),
+            "{message}"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -695,5 +1195,219 @@ mod tests {
             filter_batch(&empty, &[], &fields, &[]).unwrap().num_rows(),
             3
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Column masking
+    // ---------------------------------------------------------------------
+
+    fn mask_rows() -> RecordBatch {
+        let bytes: Vec<Option<&[u8]>> = vec![Some(&[1, 2, 3, 4, 5, 6]), Some(&[1, 2]), None];
+        batch(
+            &rule_fields(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(12345), Some(7), None])),
+                Arc::new(StringArray::from(vec![
+                    Some("supersecret"),
+                    Some("ab"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![Some("MiXed"), None, Some("x")])),
+                Arc::new(BinaryArray::from(bytes)),
+                Arc::new(StringArray::from(vec!["héllo wörld", "q", "z"])),
+            ],
+        )
+    }
+
+    fn masked(column: &str, mask: &str) -> RecordBatch {
+        let fields = rule_fields();
+        let rules = parse(&[], &[(column, mask)], &fields).unwrap();
+        mask_batch(&mask_rows(), &rules.masks, &fields, &fields).unwrap()
+    }
+
+    #[test]
+    fn test_string_masks_propagate_nulls_as_java_does() {
+        let (name, alias) = (input("name"), input("alias"));
+        let cases = [
+            (NULL.to_string(), vec![None, None, None]),
+            (field_ref("alias"), vec![Some("MiXed"), None, Some("x")]),
+            (
+                string_transform("UPPER", &[&alias]),
+                vec![Some("MIXED"), None, Some("X")],
+            ),
+            (
+                string_transform("LOWER", &[&alias]),
+                vec![Some("mixed"), None, Some("x")],
+            ),
+            (
+                string_transform("CONCAT", &[&name, r#""-""#, &alias]),
+                vec![Some("supersecret-MiXed"), None, None],
+            ),
+            (
+                string_transform("CONCAT", &[r#""****""#]),
+                vec![Some("****"); 3],
+            ),
+            (string_transform("CONCAT", &[&name, "null"]), vec![None; 3]),
+            // CONCAT_WS skips null payloads and is null on a null separator.
+            (
+                string_transform("CONCAT_WS", &[r#""-""#, r#""x""#, &name, "null", &alias]),
+                vec![Some("x-supersecret-MiXed"), Some("x-ab"), Some("x-x")],
+            ),
+            (
+                string_transform("CONCAT_WS", &[&alias, &name, r#""y""#]),
+                vec![Some("supersecretMiXedy"), None, Some("y")],
+            ),
+            (
+                string_transform("CONCAT_WS", &[r#""-""#, "null", "null"]),
+                vec![Some(""); 3],
+            ),
+        ];
+        for (mask, expected) in cases {
+            let out = masked("name", &mask);
+            assert_eq!(strings(&out, 1), expected, "{mask}");
+            assert_eq!(strings(&out, 2), [Some("MiXed"), None, Some("x")], "{mask}");
+        }
+    }
+
+    #[test]
+    fn test_a_cast_java_converts_differently_is_refused() {
+        let fields = vec![
+            field(0, "n", DataType::BigInt(crate::spec::BigIntType::new())),
+            field(
+                1,
+                "ts",
+                DataType::Timestamp(crate::spec::TimestampType::new(3).unwrap()),
+            ),
+            field(2, "d", DataType::Double(crate::spec::DoubleType::new())),
+            field(3, "s", string()),
+            field(4, "b", DataType::VarBinary(VarBinaryType::new(10).unwrap())),
+        ];
+        for (target, mask) in [
+            ("ts", cast("n", "TIMESTAMP(3)")),
+            ("s", cast("d", "VARCHAR(10)")),
+            ("s", cast("b", "VARCHAR(10)")),
+            // Java trims the string first.
+            ("n", cast("s", "BIGINT")),
+        ] {
+            let message = refusal(parse(&[], &[(target, &mask)], &fields));
+            assert!(message.contains("as Java does"), "{mask}: {message}");
+        }
+        for (target, mask) in [
+            ("s", cast("n", "VARCHAR(10)")),
+            ("b", cast("s", "VARBINARY(10)")),
+            ("ts", cast("ts", "TIMESTAMP(3)")),
+        ] {
+            assert!(parse(&[], &[(target, &mask)], &fields).is_ok(), "{mask}");
+        }
+    }
+
+    #[test]
+    fn test_a_cast_mask_applies_the_declared_width() {
+        for (mask, expected) in [
+            (
+                cast("name", "VARCHAR(3)"),
+                vec![Some("sup"), Some("ab"), None],
+            ),
+            (
+                cast("name", "CHAR(5)"),
+                vec![Some("super"), Some("ab   "), None],
+            ),
+            // Characters, not bytes.
+            (
+                cast("nn", "VARCHAR(3)"),
+                vec![Some("hél"), Some("q"), Some("z")],
+            ),
+            (cast("id", "VARCHAR(2)"), vec![Some("12"), Some("7"), None]),
+        ] {
+            assert_eq!(strings(&masked("name", &mask), 1), expected, "{mask}");
+        }
+        let cases: [(String, Vec<Option<&[u8]>>); 3] = [
+            (
+                cast("bin", "BINARY(4)"),
+                vec![Some(&[1, 2, 3, 4]), Some(&[1, 2, 0, 0]), None],
+            ),
+            (
+                cast("bin", "VARBINARY(4)"),
+                vec![Some(&[1, 2, 3, 4]), Some(&[1, 2]), None],
+            ),
+            (
+                cast("name", "BINARY(3)"),
+                vec![Some(b"sup"), Some(b"ab\0"), None],
+            ),
+        ];
+        for (mask, expected) in cases {
+            let out = masked("bin", &mask);
+            let bytes = out.column(3).as_any().downcast_ref::<BinaryArray>();
+            assert_eq!(
+                bytes.unwrap().iter().collect::<Vec<_>>(),
+                expected,
+                "{mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_copy_of_a_masked_column_is_masked() {
+        let fields = rule_fields();
+        let rows = mask_rows().project(&[1, 0, 1]).unwrap();
+        let rows_fields = [fields[1].clone(), fields[0].clone(), fields[1].clone()];
+        let mask = string_transform("CONCAT", &[&input("name"), r#""!""#]);
+        let rules = parse(&[], &[("name", &mask)], &fields).unwrap();
+        let out = mask_batch(&rows, &rules.masks, &fields, &rows_fields).unwrap();
+        for column in [0, 2] {
+            assert_eq!(
+                strings(&out, column),
+                [Some("supersecret!"), Some("ab!"), None]
+            );
+        }
+        assert_eq!(out.column(1), rows.column(1));
+    }
+
+    #[test]
+    fn test_masks_read_the_batch_as_read() {
+        // Parsing refuses this pair; applied anyway, `name` still sees the raw `id`.
+        let fields = rule_fields();
+        let masks = [
+            ColumnMask {
+                column: 0,
+                transform: Transform::Null,
+            },
+            ColumnMask {
+                column: 1,
+                transform: Transform::Cast(0, string()),
+            },
+        ];
+        let out = mask_batch(&mask_rows(), &masks, &fields, &fields).unwrap();
+        assert_eq!(out.column(0).null_count(), 3);
+        assert_eq!(strings(&out, 1), [Some("12345"), Some("7"), None]);
+    }
+
+    #[test]
+    fn test_a_mask_refuses_a_batch_without_its_columns() {
+        let fields = rule_fields();
+        let rows = mask_rows();
+        let mask = field_ref("alias");
+        let masks = parse(&[], &[("name", &mask)], &fields).unwrap().masks;
+        let without_target = rows.project(&[0, 2]).unwrap();
+        let message = refusal(mask_batch(
+            &without_target,
+            &masks,
+            &fields,
+            &[fields[0].clone(), fields[2].clone()],
+        ));
+        assert!(message.contains("does not carry 'name'"), "{message}");
+        let without_input = rows.project(&[0, 1]).unwrap();
+        let message = refusal(mask_batch(&without_input, &masks, &fields, &fields[..2]));
+        assert!(message.contains("does not carry 'alias'"), "{message}");
+    }
+
+    #[test]
+    fn test_no_mask_keeps_a_zero_column_batch_whole() {
+        let options = RecordBatchOptions::new().with_row_count(Some(3));
+        let empty =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)
+                .unwrap();
+        let out = mask_batch(&empty, &[], &rule_fields(), &[]).unwrap();
+        assert_eq!(out.num_rows(), 3);
     }
 }

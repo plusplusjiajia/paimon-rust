@@ -973,27 +973,61 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
-    /// Reads what the row filter needs, filters on stored values and projects
-    /// back (Java `doAuth`).
+    /// Reads what the rules need, then filters on raw values, masks, applies the
+    /// caller's conjuncts on masked columns and projects back (Java `doAuth`).
     fn read_restricted(
         &self,
         data_splits: &[DataSplit],
         grant: &super::query_auth::QueryAuthGrant,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        use super::query_auth::{filter_batch, unsupported};
+        use super::query_auth::{filter_batch, mask_batch, mask_inputs, unsupported};
+        use std::collections::HashSet;
 
         let schema_fields = self.table.schema().fields().to_vec();
         let rules = grant.rules();
+        if self.row_filter_factory.is_some() {
+            return Err(unsupported(
+                "an engine decoder filter would match raw values under the server's rules",
+            ));
+        }
+
+        let masked = rules.masked_columns();
+        let columns_of = |predicate: &Predicate| {
+            let mut columns = HashSet::new();
+            predicate.collect_leaf_field_indices(&mut columns);
+            columns
+        };
+        let (after_mask, raw): (Vec<Predicate>, Vec<Predicate>) = self
+            .data_predicates
+            .iter()
+            .cloned()
+            .partition(|p| !columns_of(p).is_disjoint(&masked));
+        let after_mask_columns: HashSet<usize> = after_mask.iter().flat_map(columns_of).collect();
         let index_of = |field: &DataField| schema_fields.iter().position(|s| s.id() == field.id());
-        let needed = rules.filter_columns();
-        // A partly projected column would feed the filter a partial value (Java
+        let visible: HashSet<usize> = self
+            .read_type
+            .iter()
+            .filter_map(index_of)
+            .chain(after_mask_columns.iter().copied())
+            .collect();
+        let masks: Vec<_> = rules
+            .masks
+            .iter()
+            .filter(|m| visible.contains(&m.column))
+            .cloned()
+            .collect();
+        let mut needed = rules.filter_columns();
+        needed.extend(&after_mask_columns);
+        masks.iter().for_each(|m| needed.extend(mask_inputs(m)));
+        // A partly projected column would feed the rules a partial value (Java
         // `validateReadType`).
         for field in &self.read_type {
             if let Some(index) = index_of(field) {
-                if needed.contains(&index) && field.data_type() != schema_fields[index].data_type()
+                if (needed.contains(&index) || masked.contains(&index))
+                    && field.data_type() != schema_fields[index].data_type()
                 {
                     return Err(unsupported(&format!(
-                        "the server's row filter reads '{}', which the read projects only in part",
+                        "the server's rules involve '{}', which the read projects only in part",
                         field.name()
                     )));
                 }
@@ -1011,10 +1045,16 @@ impl<'a> PaimonTableRead<'a> {
         }
         let mut inner = self.clone();
         inner.read_type = physical.clone();
+        inner.data_predicates = raw;
         inner.limit = None;
         let stream = inner.read_splits(data_splits, &self.table.schema.core_options())?;
 
         let filters = rules.filters.clone();
+        let after_mask = crate::arrow::format::FilePredicates {
+            predicates: after_mask,
+            row_filter_factory: None,
+            file_fields: schema_fields.clone(),
+        };
         let projection: Vec<usize> = (0..self.read_type.len()).collect();
         let stream = stream.map(move |batch| {
             let batch = batch?;
@@ -1031,6 +1071,12 @@ impl<'a> PaimonTableRead<'a> {
                 ));
             }
             let batch = filter_batch(&batch, &filters, &schema_fields, &physical)?;
+            let batch = mask_batch(&batch, &masks, &schema_fields, &physical)?;
+            let batch = crate::arrow::residual::filter_record_batch_by_predicates(
+                batch,
+                &after_mask,
+                &physical,
+            )?;
             batch
                 .project(&projection)
                 .map_err(|e| crate::Error::DataInvalid {
@@ -2474,6 +2520,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                masks: Vec::new(),
             },
         )
     }
@@ -2670,7 +2717,10 @@ mod tests {
             let grant = crate::table::query_auth::QueryAuthGrant::new(
                 table.query_auth_session().unwrap(),
                 Some(Vec::new()),
-                crate::table::query_auth::Rules { filters },
+                crate::table::query_auth::Rules {
+                    filters,
+                    masks: Vec::new(),
+                },
             );
             let split = split_with_grant(Some(grant));
             let narrow = TableRead::new(&table, Vec::new(), Vec::new());

@@ -16,7 +16,7 @@
 // under the License.
 
 //! SQL over a `query-auth.enabled` table whose REST server sets a row filter
-//! for the current user.
+//! and column masking for the current user.
 
 mod common;
 
@@ -141,6 +141,18 @@ async fn restricted_people(
     (tmp, server, context)
 }
 
+/// Upper-cases `name` and hides `secret`.
+fn masks() -> Option<HashMap<String, String>> {
+    let name = json!({"index": 1, "name": "name", "type": "VARCHAR(255)"});
+    Some(HashMap::from([
+        (
+            "name".to_string(),
+            json!({"name": "UPPER", "inputs": [name]}).to_string(),
+        ),
+        ("secret".to_string(), json!({"name": "NULL"}).to_string()),
+    ]))
+}
+
 async fn query(context: &SQLContext, sql: &str) -> Vec<RecordBatch> {
     context.sql(sql).await.unwrap().collect().await.unwrap()
 }
@@ -207,6 +219,51 @@ async fn test_query_auth_queries_see_only_the_rows_the_filter_admits() {
         min.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
         7
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_query_auth_where_on_a_masked_column_matches_masked_values() {
+    let (_tmp, _server, context) = restricted_people(masks()).await;
+
+    assert_eq!(
+        id_names(&query(&context, &format!("SELECT id, name FROM {TABLE}")).await),
+        vec![
+            (7, "GRACE".to_string()),
+            (8, "HEIDI".to_string()),
+            (9, "IVAN".to_string()),
+            (10, "JUDY".to_string()),
+        ]
+    );
+    assert_eq!(
+        id_names(
+            &query(
+                &context,
+                &format!("SELECT id, name FROM {TABLE} WHERE name = 'GRACE'")
+            )
+            .await
+        ),
+        vec![(7, "GRACE".to_string())]
+    );
+    assert!(id_names(
+        &query(
+            &context,
+            &format!("SELECT id, name FROM {TABLE} WHERE name = 'grace'")
+        )
+        .await
+    )
+    .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_query_auth_aggregates_see_masked_values_not_the_manifest_statistics() {
+    let (_tmp, _server, context) = restricted_people(masks()).await;
+
+    assert_eq!(
+        count(&query(&context, &format!("SELECT COUNT(secret) FROM {TABLE}")).await),
+        0
+    );
+    let max = single(&query(&context, &format!("SELECT MAX(secret) FROM {TABLE}")).await);
+    assert!(max.is_null(0), "{max:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

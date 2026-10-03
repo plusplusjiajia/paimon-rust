@@ -1540,13 +1540,14 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 ### Query Authorization
 
 When a table in a REST catalog has `'query-auth.enabled' = 'true'`, planning a
-query asks the catalog what the current user may read, and the row filters it
-returns (see `create_policy`) are applied to the result:
+query asks the catalog what the current user may read, and the row filters and
+column masks it returns (see `create_policy`) are applied to the result:
 
-- Rows are filtered on their stored values.
-- A user the catalog also masks columns for is refused.
-- Statistics are not used under a row filter, which also turns off `LIMIT`
-  pushdown, so such queries read the data.
+- Rows are filtered on their stored values; masked columns return masked values.
+- A filter on a masked column matches the masked value. A filter on a masked
+  partition key is refused.
+- Statistics are not used under a row filter or a mask, and a row filter turns
+  off `LIMIT` pushdown, so such queries read the data.
 - Time travel, branches, system tables, incremental and audit-log reads, and
   search are refused on such tables.
 
